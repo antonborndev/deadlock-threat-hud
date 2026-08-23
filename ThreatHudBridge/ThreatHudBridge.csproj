@@ -1,0 +1,124 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <PublishTrimmed>false</PublishTrimmed>
+    <!--
+      This executable runs both the WinForms supervisor and a low-traffic
+      localhost worker. Microsoft.NET.Sdk.Web enables Server GC by default,
+      which creates a heap per logical CPU in both processes and retains a
+      very large working set after image/transport bursts. Workstation GC is
+      the appropriate mode for this desktop application.
+    -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <IsTransformWebConfigDisabled>true</IsTransformWebConfigDisabled>
+    <ApplicationIcon>ThreatHudBridge.ico</ApplicationIcon>
+
+    <ThreatHudBroadcastParserDirectory>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)\..\ThreatHudBroadcastParser'))</ThreatHudBroadcastParserDirectory>
+    <ThreatHudBroadcastParserManifest>$(ThreatHudBroadcastParserDirectory)\Cargo.toml</ThreatHudBroadcastParserManifest>
+    <ThreatHudBroadcastParserExecutable>$(ThreatHudBroadcastParserDirectory)\target\release\ThreatHudBroadcastParser.exe</ThreatHudBroadcastParserExecutable>
+    <ThreatHudModVpkPath>$(MSBuildProjectDirectory)\pak57_dir.vpk</ThreatHudModVpkPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Steamworks.NET.AnyCPU" Version="2025.162.1" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.29" />
+
+    <!-- Build-only source of protoc.exe and standard Google .proto files. -->
+    <PackageReference
+      Include="Grpc.Tools"
+      Version="2.83.0"
+      PrivateAssets="All"
+      GeneratePathProperty="true"
+    />
+
+    <!--
+      The native Rust parser is compiled before CoreCompile and embedded into
+      ThreatHudBridge.dll. During single-file publish that managed assembly,
+      including this resource, is bundled into ThreatHudBridge.exe.
+    -->
+    <EmbeddedResource Include="$(ThreatHudBroadcastParserExecutable)">
+      <LogicalName>ThreatHudBridge.Resources.ThreatHudBroadcastParser.exe</LogicalName>
+    </EmbeddedResource>
+
+    <!--
+      Use one deterministic build input. A wildcard or "first VPK found"
+      could silently embed an old or unrelated mod package.
+    -->
+    <EmbeddedResource
+      Include="$(ThreatHudModVpkPath)"
+      Condition="Exists('$(ThreatHudModVpkPath)')">
+      <LogicalName>ThreatHudBridge.Resources.pak57_dir.vpk</LogicalName>
+    </EmbeddedResource>
+
+    <None Update="steam_appid.txt">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
+  <Target
+    Name="ValidateThreatHudModVpk"
+    BeforeTargets="PrepareForBuild"
+    Condition="'$(DesignTimeBuild)' != 'true'">
+
+    <ItemGroup>
+      <ThreatHudUnexpectedVpkChunk
+        Include="$(MSBuildProjectDirectory)\pak57_*.vpk"
+        Exclude="$(ThreatHudModVpkPath)" />
+    </ItemGroup>
+
+    <Error
+      Condition="!Exists('$(ThreatHudModVpkPath)')"
+      Text="Threat HUD VPK was not found. Put the single-file payload at: $(ThreatHudModVpkPath)" />
+
+    <Error
+      Condition="'@(ThreatHudUnexpectedVpkChunk)' != ''"
+      Text="Split VPK chunks were found next to pak57_dir.vpk. ThreatHudBridge currently accepts one self-contained VPK only: @(ThreatHudUnexpectedVpkChunk, ', ')" />
+  </Target>
+
+  <Target
+    Name="BuildThreatHudBroadcastParser"
+    BeforeTargets="CoreCompile"
+    Condition="'$(DesignTimeBuild)' != 'true' And Exists('$(ThreatHudBroadcastParserManifest)')">
+
+    <PropertyGroup>
+      <ThreatHudProtocExecutable>$(PkgGrpc_Tools)\tools\windows_x64\protoc.exe</ThreatHudProtocExecutable>
+      <ThreatHudProtocIncludeDirectory>$(PkgGrpc_Tools)\build\native\include</ThreatHudProtocIncludeDirectory>
+    </PropertyGroup>
+
+    <Error
+      Condition="'$(PkgGrpc_Tools)' == ''"
+      Text="NuGet did not generate the Grpc.Tools package path property. Run dotnet restore and build again." />
+
+    <Error
+      Condition="!Exists('$(ThreatHudProtocExecutable)')"
+      Text="Grpc.Tools protoc.exe was not found at: $(ThreatHudProtocExecutable)" />
+
+    <Error
+      Condition="!Exists('$(ThreatHudProtocIncludeDirectory)')"
+      Text="Grpc.Tools protobuf include directory was not found at: $(ThreatHudProtocIncludeDirectory)" />
+
+    <Message Importance="high" Text="Building embedded ThreatHudBroadcastParser.exe with Cargo..." />
+    <Message Importance="high" Text="Using protoc: $(ThreatHudProtocExecutable)" />
+
+    <Exec
+      Command="cargo build --release --locked --manifest-path &quot;$(ThreatHudBroadcastParserManifest)&quot;"
+      WorkingDirectory="$(ThreatHudBroadcastParserDirectory)"
+      EnvironmentVariables="PROTOC=$(ThreatHudProtocExecutable);PROTOC_INCLUDE=$(ThreatHudProtocIncludeDirectory)" />
+
+    <Error
+      Condition="!Exists('$(ThreatHudBroadcastParserExecutable)')"
+      Text="Cargo completed but ThreatHudBroadcastParser.exe was not created." />
+  </Target>
+</Project>

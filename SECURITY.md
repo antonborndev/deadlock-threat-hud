@@ -10,7 +10,7 @@ are supported.
 Do not post credentials, private logs, temporary broadcast URLs, or other
 sensitive information in a public issue. Use GitHub's private vulnerability
 reporting feature when it is enabled for this repository. General support is
-available through https://discord.gg/MJcXrGXGt.
+available through https://discord.com/invite/H68kUYEEPA.
 
 Include the affected release, reproduction steps, and the smallest useful
 redacted log excerpt.

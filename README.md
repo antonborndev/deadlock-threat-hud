@@ -174,7 +174,7 @@ into it, but no rights in its excluded components are granted by this project.
 ## Links
 
 - Website: https://deadlock.ltd
-- Community and support: https://discord.gg/MJcXrGXGt
+- Community and support: https://discord.com/invite/H68kUYEEPA
 
 Third-party components and Valve-derived materials are identified in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

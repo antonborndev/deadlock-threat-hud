@@ -1,0 +1,153 @@
+<root>
+	<styles>
+		<include src="s2r://panorama/styles/base.vcss_c" />
+	</styles>
+
+	<scripts>
+		<include src="s2r://panorama/scripts/threathud_purchase_history.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_enemy_team.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_match_roster.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_item_catalog.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_panel_utils.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_identity_utils.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_hud_logger.vjs_c" />
+		
+		<include src="s2r://panorama/scripts/threathud_manual_test.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_debug_controls.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_recent_purchase_observer.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_enemy_team_monitor.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_match_roster_monitor.vjs_c" />
+
+		<include src="s2r://panorama/scripts/threathud_local_host_client.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_service_status_client.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_hero_damage_client.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_resolved_roster_client_utils.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_lane_advisor_client.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_lane_advisor_overlay.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_player_stats_client.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_player_ranks_client.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_player_reaction_client.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_ui_utils.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_hero_damage_overlay.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_reaction_visuals.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_match_roster_matcher.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_hero_damage_monitor.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_stats_overlay.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_reaction_overlay.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_reaction_monitor.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_stats_monitor.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_rank_overlay.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_current_match_rank_monitor.vjs_c" />
+
+		<include src="s2r://panorama/scripts/threathud_match_screen_monitor.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_controller.vjs_c" />
+	</scripts>
+
+	<Panel
+		class="WindowRoot"
+		hittest="false"
+		hittest-children="true"
+		disallowedstyleflags="hover,descendantfocus"
+	>
+		<CitadelHud
+			id="Hud"
+			hittest="false"
+		/>
+
+		<Panel
+			id="ThreatHudLogWindow"
+			horizontal-align="right"
+			vertical-align="top"
+			flow-children="down"
+			hittest="true"
+			hittest-children="true"
+			style="
+				width: 560px;
+				height: 360px;
+				margin-top: 440px;
+				margin-right: 30px;
+				padding: 12px;
+				background-color: #080808e8;
+				border: 1px solid #ffffff30;
+			"
+		>
+			<Panel
+				id="ThreatHudLogViewport"
+				hittest="true"
+				hittest-children="true"
+				style="
+					width: 100%;
+					height: fill-parent-flow(1.0);
+					overflow: squish scroll;
+					padding-right: 8px;
+				"
+			>
+				<Label
+					id="ThreatHudLogText"
+					text=""
+					hittest="false"
+					style="
+						width: 100%;
+						height: fit-children;
+						white-space: normal;
+						font-size: 15px;
+						color: #e8e8e8;
+						text-shadow: 1px 1px 1px 1.0 #000000;
+					"
+				/>
+			</Panel>
+
+			<Button
+				id="ThreatHudManualTestButton"
+				hittest="true"
+				style="
+					width: 74px;
+					height: 30px;
+					horizontal-align: right;
+					vertical-align: top;
+					margin-top: 6px;
+					margin-right: 6px;
+					background-color: #252525ee;
+					border: 1px solid #888888;
+				"
+			>
+				<Label
+					text="RUN"
+					hittest="false"
+					style="
+						horizontal-align: center;
+						vertical-align: center;
+						font-size: 15px;
+						color: white;
+					"
+				/>
+			</Button>
+
+			<Button
+				id="ThreatHudCopyLogButton"
+				hittest="true"
+				style="
+					width: 74px;
+					height: 30px;
+					horizontal-align: right;
+					vertical-align: top;
+					margin-top: 6px;
+					margin-right: 86px;
+					background-color: #252525ee;
+					border: 1px solid #888888;
+				"
+			>
+				<Label
+					text="COPY"
+					hittest="false"
+					style="
+						horizontal-align: center;
+						vertical-align: center;
+						font-size: 15px;
+						color: white;
+					"
+				/>
+			</Button>
+		</Panel>
+	</Panel>
+</root>

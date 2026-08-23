@@ -1,0 +1,115 @@
+# Operating-system files
+.DS_Store
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
+
+# Visual Studio, Rider and editor-local state
+.vs/
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.rsuser
+*.DotSettings.user
+*.code-workspace
+
+# .NET build and publish output
+**/bin/
+**/obj/
+**/dist/
+**/publish/
+**/artifacts/
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+*.trx
+*.pdb
+*.dll
+*.exe
+*.deps.json
+*.runtimeconfig.json
+project.assets.json
+*.nuget.g.props
+*.nuget.g.targets
+
+# Rust build output
+**/target/
+*.rs.bk
+# Cargo.lock is intentionally tracked because the parser is an application.
+
+# Node/Python tool caches
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local caches, logs and temporary files
+.cache/
+cache/
+temp/
+tmp/
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.rej
+*~
+
+# Local databases, dumps and runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.dmp
+*.mdmp
+*.crash
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+appsettings.Local.json
+appsettings.*.local.json
+tools/data/config.json
+tools/data/texture_config.json
+secrets.json
+*.secrets.json
+*.pfx
+*.p12
+*.pem
+*.key
+*.snk
+*.jks
+*.keystore
+
+# Generated packages and release archives
+*.vpk
+!ThreatHudBridge/pak57_dir.vpk
+*.zip
+*.7z
+*.rar
+
+# Deadlock mod compiler output and cache
+tools/builds/
+tools/temp/
+tools/cache/
+tools/data/build_cache.json
+tools/data/mod_registry.json
+pak*_unpacked/
+
+# Reverse-engineering and private development workspaces
+research/
+AGENTS.md

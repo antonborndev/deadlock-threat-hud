@@ -62,11 +62,11 @@ var ThreatHud = ThreatHud || {};
             false;
 
         /*
-         * The context is published only after
-         * the stats overlay successfully rendered winrate.
-         *
-         * Therefore, the rank subscriber cannot start
-         * before winrate appears in the HUD.
+         * The context is published only after the stats
+         * presentation adapter accepted all 12 players.
+         * The adapter still accepts and forwards context
+         * while the Winrate visuals are disabled, so Rank
+         * and Reaction do not depend on Winrate visibility.
          */
         this._onRosterContextChanged =
             typeof onRosterContextChanged ===
@@ -191,6 +191,14 @@ var ThreatHud = ThreatHud || {};
             laneAdvisorStopped;
 
         this._clearRosterContext();
+
+        if (
+            this._statsOverlay &&
+            typeof this._statsOverlay.clear ===
+                'function'
+        ) {
+            this._statsOverlay.clear();
+        }
 
         this._cancelSandboxServiceStatus();
 
@@ -463,10 +471,10 @@ var ThreatHud = ThreatHud || {};
         );
 
         /*
-         * Continuing the stats workflow is allowed
-         * after Bridge has confirmed exactly
-         * START Lane Advisor.
-         *
+         * Continue after the Advisor client accepts the roster.
+         * When Adviser is enabled this is the Bridge START ACK;
+         * when it is disabled the client acknowledges locally and
+         * keeps the roster for a possible later resume.
          * The lane API result itself is NOT awaited here.
          */
         function continueWorkflow() {
@@ -568,8 +576,7 @@ var ThreatHud = ThreatHud || {};
 
     /*
      * The existing stats workflow remains here.
-     *
-     * We enter it after Advisor START ACK,
+     * We enter it after the Advisor client ACK,
      * not after the Advisor API request completes.
      */
     CurrentMatchStatsMonitor.prototype

@@ -3,7 +3,7 @@ name = "threathud-broadcast-parser"
 version = "0.2.0"
 edition = "2024"
 description = "Deadlock Threat HUD dynamic live player-damage parser"
-license = "GPL-3.0-only"
+license = "MIT"
 publish = false
 
 [[bin]]

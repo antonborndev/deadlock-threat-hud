@@ -1,3 +1,5 @@
+cp "C:\Program Files (x86)\Steam\steamapps\common\Deadlock\game\citadel\addons\pak01_dir.vpk" pak57_dir.vpk
+
 $ErrorActionPreference = "Stop"
 
 Set-Location $PSScriptRoot
@@ -350,3 +352,5 @@ Get-ChildItem `
     }
 
 Write-Host ""
+
+

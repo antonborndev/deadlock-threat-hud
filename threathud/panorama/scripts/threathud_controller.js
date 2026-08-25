@@ -214,12 +214,26 @@ var ThreatHud = ThreatHud || {};
 				hudMsg
 			);
 
+	var currentMatchStatsDisplayGate =
+		new ThreatHud.ModuleDisplayGate(
+			currentMatchStatsOverlay,
+			'Winrate',
+			hudMsg
+		);
+
 	var currentMatchRankOverlay =
 		new ThreatHud
 			.CurrentMatchRankOverlay(
 				topPanel,
 				hudMsg
 			);
+
+	var currentMatchRankDisplayGate =
+		new ThreatHud.ModuleDisplayGate(
+			currentMatchRankOverlay,
+			'Rank',
+			hudMsg
+		);
 
 	var currentMatchReactionOverlay =
 		new ThreatHud
@@ -239,21 +253,21 @@ var ThreatHud = ThreatHud || {};
 			.CurrentMatchReactionMonitor(
 				playerReactionClient,
 				currentMatchReactionOverlay,
-				currentMatchStatsOverlay,
+				currentMatchStatsDisplayGate,
 				hudMsg
 			);
 
 	var currentMatchStatsOverlayAdapter =
 		new ThreatHud
 			.CurrentMatchReactionStatsOverlayAdapter(
-				currentMatchStatsOverlay,
+				currentMatchStatsDisplayGate,
 				currentMatchReactionMonitor
 			);
 
 	var currentMatchRankOverlayAdapter =
 		new ThreatHud
 			.CurrentMatchReactionRankOverlayAdapter(
-				currentMatchRankOverlay,
+				currentMatchRankDisplayGate,
 				currentMatchReactionMonitor
 			);
 
@@ -296,6 +310,34 @@ var ThreatHud = ThreatHud || {};
 			hudMsg
 		);
 
+	var moduleSettingsMonitor =
+		new ThreatHud.ModuleSettingsMonitor(
+			localHostClient,
+			hudMsg,
+
+			function (settings) {
+				currentMatchStatsDisplayGate
+					.setEnabled(
+						settings.winrate
+					);
+
+				currentMatchRankDisplayGate
+					.setEnabled(
+						settings.rank
+					);
+
+				laneAdvisorClient
+					.setEnabled(
+						settings.adviser
+					);
+
+				currentMatchHeroDamageMonitor
+					.setEnabled(
+						settings.heroDamage
+					);
+			}
+		);
+
 	var ManualTestbtn =
 		new ThreatHud
 			.ManualTest(
@@ -329,6 +371,8 @@ var ThreatHud = ThreatHud || {};
 	//enemyTeamMonitor.start();
 
 	//recentPurchaseObserver.start();
+
+	moduleSettingsMonitor.start();
 
 	matchScreenMonitor.start();
 

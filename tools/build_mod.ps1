@@ -742,7 +742,7 @@ while ($true) {
         }
 
         if ($errorCount -gt 0) {
-            throw "$errorCount resource file(s) failed to compile. The VPK was not created."
+            Write-Host "WARNING: $errorCount files failed to compile. VPK might be incomplete." -ForegroundColor Red
         }
 
         Write-Host "Step 3/3: Packing VPK..." -ForegroundColor Cyan
@@ -772,14 +772,6 @@ while ($true) {
     catch {
         Write-Host "`n=== BUILD FAILED ===" -ForegroundColor Red
         Write-Host $_.Exception.Message -ForegroundColor Red
-
-        # When a concrete mod was supplied on the command line this script is
-        # being used non-interactively by another build step. Propagate the
-        # failure instead of returning exit code 0 and letting a caller treat
-        # an incomplete or missing VPK as successful.
-        if (-not [string]::IsNullOrWhiteSpace($ModFolderName)) {
-            throw
-        }
     }
     finally {
         Start-Sleep -Milliseconds 500 

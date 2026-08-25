@@ -897,6 +897,17 @@ var ThreatHud = ThreatHud || {};
         return rendered;
     }
 
+    function clearAndUnpublish() {
+        try {
+            return this._overlay.clear();
+        } finally {
+            publishAdapterPlayers(
+                this,
+                null
+            );
+        }
+    }
+
     function initializeAdapter(
         adapter,
         overlay,
@@ -928,6 +939,9 @@ var ThreatHud = ThreatHud || {};
     CurrentMatchReactionStatsOverlayAdapter.prototype.render =
         renderAndPublish;
 
+    CurrentMatchReactionStatsOverlayAdapter.prototype.clear =
+        clearAndUnpublish;
+
     function CurrentMatchReactionRankOverlayAdapter(
         rankOverlay,
         reactionMonitor
@@ -944,16 +958,7 @@ var ThreatHud = ThreatHud || {};
         renderAndPublish;
 
     CurrentMatchReactionRankOverlayAdapter.prototype.clear =
-        function () {
-            try {
-                return this._overlay.clear();
-            } finally {
-                publishAdapterPlayers(
-                    this,
-                    null
-                );
-            }
-        };
+        clearAndUnpublish;
 
     ThreatHud.CurrentMatchReactionMonitor =
         CurrentMatchReactionMonitor;

@@ -56,15 +56,9 @@ var ThreatHud = ThreatHud || {};
                 return false;
             }
 
-            for (
-                var hideIndex = 0;
-                hideIndex < players.length;
-                hideIndex += 1
-            ) {
-                this._hideExistingOverlays(
-                    players[hideIndex].panel
-                );
-            }
+            this.clear(
+                players
+            );
 
             var renderedCount =
                 0;
@@ -99,6 +93,38 @@ var ThreatHud = ThreatHud || {};
                 renderedCount ===
                     players.length
             );
+        };
+
+    CurrentMatchStatsOverlay.prototype.clear =
+        function (players) {
+            if (!players) {
+                return 0;
+            }
+
+            var clearedCount =
+                0;
+
+            for (
+                var index = 0;
+                index < players.length;
+                index += 1
+            ) {
+                if (
+                    players[index] &&
+                    isValidPanel(
+                        players[index].panel
+                    )
+                ) {
+                    this._hideExistingOverlays(
+                        players[index].panel
+                    );
+
+                    clearedCount +=
+                        1;
+                }
+            }
+
+            return clearedCount;
         };
 
     /*

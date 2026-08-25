@@ -66,10 +66,11 @@ internal sealed class MainForm : Form
     private readonly Label _httpValue;
     private readonly Label _accountIdValue;
 
-    private readonly Label _winrateServiceValue;
-    private readonly Label _rankServiceValue;
-    private readonly Label _adviserServiceValue;
-    private readonly Label _heroDamageServiceValue;
+    private readonly BridgeServiceStatusControl
+        _serviceStatusControl;
+
+    private BridgeModuleSettings
+        _persistedModuleSettings;
 
     private readonly Button _installModButton;
     private readonly Button _activateModButton;
@@ -172,6 +173,10 @@ internal sealed class MainForm : Form
 
     public MainForm()
     {
+        _persistedModuleSettings =
+            BridgeModuleSettingsPersistence
+                .Load();
+
         Text = "Threat HUD Bridge";
 
         StartPosition =
@@ -271,10 +276,8 @@ internal sealed class MainForm : Form
                 out _steamValue,
                 out _httpValue,
                 out _accountIdValue,
-                out _winrateServiceValue,
-                out _rankServiceValue,
-                out _adviserServiceValue,
-                out _heroDamageServiceValue,
+                _persistedModuleSettings,
+                out _serviceStatusControl,
                 out _installModButton,
                 out _activateModButton
             );
@@ -618,6 +621,9 @@ internal sealed class MainForm : Form
 
         _activateModButton.Click +=
             OnActivateModButtonClick;
+
+        _serviceStatusControl.SettingsChanged +=
+            OnModuleSettingsChanged;
 
         Shown +=
             OnModManagementShown;
@@ -1275,100 +1281,47 @@ internal sealed class MainForm : Form
         RunOnUiThread(
             () =>
             {
-                ApplyServiceState(
-                    _winrateServiceValue,
-                    snapshot?.Winrate
-                );
-
-                ApplyServiceState(
-                    _rankServiceValue,
-                    snapshot?.Rank
-                );
-
-                ApplyServiceState(
-                    _adviserServiceValue,
-                    snapshot?.Adviser
-                );
-
-                ApplyServiceState(
-                    _heroDamageServiceValue,
-                    snapshot?.HeroDamage
-                );
+                _serviceStatusControl
+                    .SetServiceStates(
+                        snapshot
+                    );
             }
         );
     }
 
-    private static void ApplyServiceState(
-        Label label,
-        BridgeServiceState? state
+    private void OnModuleSettingsChanged(
+        object? sender,
+        BridgeModuleSettingsChangedEventArgs e
     )
     {
-        var text =
-            !state.HasValue
-                ? "—"
-                : state.Value switch
-                {
-                    BridgeServiceState.InProgress =>
-                        "In progress",
-
-                    BridgeServiceState.Completed =>
-                        "Done",
-
-                    BridgeServiceState.Error =>
-                        "Error",
-
-                    _ =>
-                        throw new ArgumentOutOfRangeException(
-                            nameof(state),
-                            state,
-                            "Unknown Bridge service state."
-                        )
-                };
-
-        var color =
-            !state.HasValue
-                ? BridgeUiTheme.TextMuted
-                : state.Value switch
-                {
-                    BridgeServiceState.InProgress =>
-                        BridgeUiTheme
-                            .ServiceInProgress,
-
-                    BridgeServiceState.Completed =>
-                        BridgeUiTheme
-                            .ServiceCompleted,
-
-                    BridgeServiceState.Error =>
-                        BridgeUiTheme
-                            .ServiceError,
-
-                    _ =>
-                        throw new ArgumentOutOfRangeException(
-                            nameof(state),
-                            state,
-                            "Unknown Bridge service state."
-                        )
-                };
-
-        if (
-            !String.Equals(
-                label.Text,
-                text,
-                StringComparison.Ordinal
-            )
-        )
+        try
         {
-            label.Text =
-                text;
+            BridgeModuleSettingsPersistence
+                .Save(
+                    e.Settings
+                );
+
+            _persistedModuleSettings =
+                e.Settings;
+
+            AppendLog(
+                "Module settings saved" +
+                " | enabledMask=" +
+                e.Settings.EnabledMask
+            );
         }
-
-        if (
-            label.ForeColor !=
-                color
-        )
+        catch (Exception error)
         {
-            label.ForeColor =
-                color;
+            _serviceStatusControl
+                .SetSettings(
+                    _persistedModuleSettings
+                );
+
+            AppendLog(
+                "Module settings save ERROR:" +
+                Environment.NewLine +
+                error
+            );
         }
     }
 
@@ -2526,6 +2479,9 @@ internal sealed class MainForm : Form
             _activateModButton.Click -=
                 OnActivateModButtonClick;
 
+            _serviceStatusControl.SettingsChanged -=
+                OnModuleSettingsChanged;
+
             try
             {
                 _modManagementCancellation.Cancel();
@@ -2696,10 +2652,9 @@ internal sealed class MainForm : Form
         out Label steamValue,
         out Label httpValue,
         out Label accountIdValue,
-        out Label winrateServiceValue,
-        out Label rankServiceValue,
-        out Label adviserServiceValue,
-        out Label heroDamageServiceValue,
+        BridgeModuleSettings moduleSettings,
+        out BridgeServiceStatusControl
+            serviceStatusControl,
         out Button installModButton,
         out Button activateModButton
     )
@@ -2792,22 +2747,19 @@ internal sealed class MainForm : Form
                 "Account ID:"
             );
 
-        var serviceControls =
-            CreateServiceStatusPanel(
-                out winrateServiceValue,
-                out rankServiceValue,
-                out adviserServiceValue,
-                out heroDamageServiceValue
+        serviceStatusControl =
+            new BridgeServiceStatusControl(
+                moduleSettings
             );
 
         panel.Controls.Add(
-            serviceControls,
+            serviceStatusControl,
             2,
             0
         );
 
         panel.SetRowSpan(
-            serviceControls,
+            serviceStatusControl,
             4
         );
 
@@ -2963,137 +2915,6 @@ internal sealed class MainForm : Form
             modControls,
             4
         );
-
-        return panel;
-    }
-
-    private TableLayoutPanel
-        CreateServiceStatusPanel(
-            out Label winrateValue,
-            out Label rankValue,
-            out Label adviserValue,
-            out Label heroDamageValue
-        )
-    {
-        var panel =
-            new TableLayoutPanel
-            {
-                Dock =
-                    DockStyle.Fill,
-
-                AutoSize =
-                    true,
-
-                ColumnCount =
-                    2,
-
-                RowCount =
-                    5,
-
-                BackColor =
-                    BridgeUiTheme.SurfaceRaised,
-
-                Margin =
-                    new Padding(
-                        18,
-                        0,
-                        12,
-                        0
-                    ),
-
-                Padding =
-                    new Padding(
-                        0
-                    )
-            };
-
-        panel.ColumnStyles.Add(
-            new ColumnStyle(
-                SizeType.Absolute,
-                105
-            )
-        );
-
-        panel.ColumnStyles.Add(
-            new ColumnStyle(
-                SizeType.Percent,
-                100F
-            )
-        );
-
-        panel.RowStyles.Add(
-            new RowStyle(
-                SizeType.AutoSize
-            )
-        );
-
-        var title =
-            new Label
-            {
-                AutoSize =
-                    true,
-
-                Text =
-                    "SERVICE STATUS",
-
-                ForeColor =
-                    BridgeUiTheme.TextMuted,
-
-                Font =
-                    new Font(
-                        "Segoe UI",
-                        8.25F,
-                        FontStyle.Bold,
-                        GraphicsUnit.Point
-                    ),
-
-                Margin =
-                    new Padding(
-                        0,
-                        0,
-                        0,
-                        3
-                    )
-            };
-
-        panel.Controls.Add(
-            title,
-            0,
-            0
-        );
-
-        panel.SetColumnSpan(
-            title,
-            2
-        );
-
-        winrateValue =
-            AddStatusRow(
-                panel,
-                1,
-                "Winrate:"
-            );
-
-        rankValue =
-            AddStatusRow(
-                panel,
-                2,
-                "Rank:"
-            );
-
-        adviserValue =
-            AddStatusRow(
-                panel,
-                3,
-                "Adviser:"
-            );
-
-        heroDamageValue =
-            AddStatusRow(
-                panel,
-                4,
-                "Hero Damage:"
-            );
 
         return panel;
     }

@@ -19,6 +19,7 @@
 		<include src="s2r://panorama/scripts/threathud_match_roster_monitor.vjs_c" />
 
 		<include src="s2r://panorama/scripts/threathud_local_host_client.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_module_settings_monitor.vjs_c" />
 		<include src="s2r://panorama/scripts/threathud_service_status_client.vjs_c" />
 		<include src="s2r://panorama/scripts/threathud_hero_damage_client.vjs_c" />
 		<include src="s2r://panorama/scripts/threathud_resolved_roster_client_utils.vjs_c" />
@@ -30,6 +31,7 @@
 		<include src="s2r://panorama/scripts/threathud_current_match_ui_utils.vjs_c" />
 		<include src="s2r://panorama/scripts/threathud_current_match_hero_damage_overlay.vjs_c" />
 		<include src="s2r://panorama/scripts/threathud_reaction_visuals.vjs_c" />
+		<include src="s2r://panorama/scripts/threathud_module_display_gate.vjs_c" />
 		<include src="s2r://panorama/scripts/threathud_match_roster_matcher.vjs_c" />
 		<include src="s2r://panorama/scripts/threathud_current_match_hero_damage_monitor.vjs_c" />
 		<include src="s2r://panorama/scripts/threathud_current_match_stats_overlay.vjs_c" />

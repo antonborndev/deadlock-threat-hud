@@ -625,7 +625,10 @@ internal enum BridgeMessageType : byte
         7,
 
     ServiceStatusAck =
-        8
+        8,
+
+    ModuleSettings =
+        9
 }
 
 internal static class BridgeProtocol

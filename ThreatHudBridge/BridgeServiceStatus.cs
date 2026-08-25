@@ -36,6 +36,33 @@ internal sealed record BridgeServiceStatusSnapshot(
             BridgeServiceState.InProgress,
             BridgeServiceState.InProgress
         );
+
+    public BridgeServiceState GetState(
+        BridgeServiceKind service
+    )
+    {
+        return service switch
+        {
+            BridgeServiceKind.Winrate =>
+                Winrate,
+
+            BridgeServiceKind.Rank =>
+                Rank,
+
+            BridgeServiceKind.Adviser =>
+                Adviser,
+
+            BridgeServiceKind.HeroDamage =>
+                HeroDamage,
+
+            _ =>
+                throw new ArgumentOutOfRangeException(
+                    nameof(service),
+                    service,
+                    "Unknown Bridge service."
+                )
+        };
+    }
 }
 
 internal static class BridgeServiceStateText
@@ -475,8 +502,7 @@ internal sealed class BridgeServiceStatusStore
                 );
 
             if (
-                GetState(
-                    _snapshot,
+                _snapshot.GetState(
                     service
                 ) ==
                     state &&
@@ -665,8 +691,7 @@ internal sealed class BridgeServiceStatusStore
                     _pendingStates[index]
                         .HasValue
                 ) &&
-                GetState(
-                    _snapshot,
+                _snapshot.GetState(
                     service
                 ) ==
                     BridgeServiceState.InProgress
@@ -744,31 +769,4 @@ internal sealed class BridgeServiceStatusStore
         };
     }
 
-    private static BridgeServiceState GetState(
-        BridgeServiceStatusSnapshot snapshot,
-        BridgeServiceKind service
-    )
-    {
-        return service switch
-        {
-            BridgeServiceKind.Winrate =>
-                snapshot.Winrate,
-
-            BridgeServiceKind.Rank =>
-                snapshot.Rank,
-
-            BridgeServiceKind.Adviser =>
-                snapshot.Adviser,
-
-            BridgeServiceKind.HeroDamage =>
-                snapshot.HeroDamage,
-
-            _ =>
-                throw new ArgumentOutOfRangeException(
-                    nameof(service),
-                    service,
-                    "Unknown Bridge service."
-                )
-        };
-    }
 }

@@ -168,8 +168,9 @@ internal sealed class DeadlockRankImageService :
                 {
                     outlinedBytes =
                         RankImageAlphaOutlineProcessor
-                            .AddWhiteOutline(
+                            .AddWhiteOutlineAndSubrankMarker(
                                 sourceBytes,
+                                subrank,
                                 RankImageDisplayBoxPixels,
                                 WhiteOutlinePixels,
                                 cancellationToken
@@ -186,7 +187,7 @@ internal sealed class DeadlockRankImageService :
                     throw new DeadlockRankImageException(
                         HttpStatusCode.BadGateway,
 
-                        "Failed to add the white alpha outline" +
+                        "Failed to process the rank image" +
                         $" | rank={rank}" +
                         $" | subrank={subrank}" +
                         $" | sourceBytes={sourceBytes.Length}" +

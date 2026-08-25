@@ -63,8 +63,9 @@ internal static class RankImageAlphaOutlineProcessor
         byte Alpha
     );
 
-    public static byte[] AddWhiteOutline(
+    public static byte[] AddWhiteOutlineAndSubrankMarker(
         byte[] sourcePng,
+        byte subrank,
         int targetDisplayBoxPixels,
         int canvasPaddingPixelsAtDisplay,
         CancellationToken cancellationToken
@@ -79,6 +80,17 @@ internal static class RankImageAlphaOutlineProcessor
             throw new ArgumentException(
                 "Source rank PNG is empty.",
                 nameof(sourcePng)
+            );
+        }
+
+        if (
+            subrank < 1 ||
+            subrank > 6
+        )
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(subrank),
+                "subrank must be from 1 to 6."
             );
         }
 
@@ -244,6 +256,15 @@ internal static class RankImageAlphaOutlineProcessor
             outputBitmap,
             sourceBitmap,
             canvasPadding
+        );
+
+        RankImageSubrankMarkerRenderer.Draw(
+            outputBitmap,
+            sourceBitmap.Width,
+            sourceBitmap.Height,
+            canvasPadding,
+            subrank,
+            cancellationToken
         );
 
         cancellationToken

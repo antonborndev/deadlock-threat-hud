@@ -1257,6 +1257,19 @@ internal sealed class ThreatHudBridgeRuntime :
                     {
                         if (
                             channel ==
+                            BridgeModuleSettingsTransport
+                                .Channel
+                        )
+                        {
+                            return BridgeModuleSettingsTransport
+                                .BuildPacket(
+                                    BridgeModuleSettingsPersistence
+                                        .Load()
+                                );
+                        }
+
+                        if (
+                            channel ==
                             BridgeServiceStatusReportService
                                 .Channel
                         )

@@ -1,3 +1,5 @@
+export-public-source.ps1
+
 # Operating-system files
 .DS_Store
 Thumbs.db

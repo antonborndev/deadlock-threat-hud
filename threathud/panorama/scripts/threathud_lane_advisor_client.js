@@ -79,6 +79,12 @@ var ThreatHud = ThreatHud || {};
 
 		this._currentMatches =
 			null;
+
+		this._enabled =
+			false;
+
+		this._deferredMatches =
+			null;
 	}
 
 	LaneAdvisorClient.prototype.startForMatches =
@@ -117,6 +123,37 @@ var ThreatHud = ThreatHud || {};
 
 			this._currentMatches =
 				matchesSnapshot;
+
+			if (!this._enabled) {
+				this._currentMatches =
+					null;
+
+				this._deferredMatches =
+					matchesSnapshot;
+
+				this._invokeCallback(
+					callback,
+					null,
+					{
+						started:
+							false,
+
+						deduplicated:
+							false,
+
+						disabled:
+							true,
+
+						localIndex:
+							localIndex
+					}
+				);
+
+				return false;
+			}
+
+			this._deferredMatches =
+				null;
 
 			if (
 				fingerprint ===
@@ -324,12 +361,63 @@ var ThreatHud = ThreatHud || {};
 			return true;
 		};
 
+	LaneAdvisorClient.prototype.setEnabled =
+		function (enabled) {
+			var nextEnabled =
+				!!enabled;
+
+			if (
+				this._enabled ===
+					nextEnabled
+			) {
+				return false;
+			}
+
+			var deferredMatches =
+				this._currentMatches
+					? this._currentMatches.slice(
+						0
+					)
+					: (
+						this._deferredMatches
+							? this._deferredMatches.slice(
+								0
+							)
+							: null
+					);
+
+			this._enabled =
+				nextEnabled;
+
+			if (!nextEnabled) {
+				this.stop();
+
+				this._deferredMatches =
+					deferredMatches;
+
+				return true;
+			}
+
+			this._deferredMatches =
+				null;
+
+			if (deferredMatches) {
+				this.startForMatches(
+					deferredMatches,
+					function () {}
+				);
+			}
+
+			return true;
+		};
+
 	LaneAdvisorClient.prototype.stop =
 		function () {
 			var hadActiveWorkflow =
 				this._lastFingerprint !== null ||
 				this._lastResult !== null ||
-				this._currentMatches !== null;
+				this._currentMatches !== null ||
+				this._deferredMatches !== null;
 
 			this._resultGeneration +=
 				1;
@@ -341,6 +429,9 @@ var ThreatHud = ThreatHud || {};
 				null;
 
 			this._currentMatches =
+				null;
+
+			this._deferredMatches =
 				null;
 
 			if (hadActiveWorkflow) {

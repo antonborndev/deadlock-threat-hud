@@ -85,6 +85,12 @@ var ThreatHud = ThreatHud || {};
 
         this._retiredMatchKeys =
             [];
+
+        this._enabled =
+            false;
+
+        this._deferredContext =
+            null;
     }
 
     CurrentMatchHeroDamageMonitor.prototype.restart =
@@ -105,6 +111,22 @@ var ThreatHud = ThreatHud || {};
 
                 return false;
             }
+
+            if (!this._enabled) {
+                this._deferredContext =
+                    contextSnapshot;
+
+                this._log(
+                    'CurrentMatchHeroDamageMonitor: PAUSED' +
+                        ' | sessionId=' +
+                        contextSnapshot.sessionId
+                );
+
+                return true;
+            }
+
+            this._deferredContext =
+                null;
 
             this._prepareMatchSession(
                 contextSnapshot.sessionId
@@ -154,11 +176,61 @@ var ThreatHud = ThreatHud || {};
             return true;
         };
 
+    CurrentMatchHeroDamageMonitor.prototype.setEnabled =
+        function (enabled) {
+            var nextEnabled =
+                !!enabled;
+
+            if (
+                this._enabled ===
+                    nextEnabled
+            ) {
+                return false;
+            }
+
+            var deferredContext =
+                this._context
+                    ? this._createContextSnapshot(
+                        this._context
+                    )
+                    : (
+                        this._deferredContext
+                            ? this._createContextSnapshot(
+                                this._deferredContext
+                            )
+                            : null
+                    );
+
+            this._enabled =
+                nextEnabled;
+
+            if (!nextEnabled) {
+                this.stop();
+
+                this._deferredContext =
+                    deferredContext;
+
+                return true;
+            }
+
+            this._deferredContext =
+                null;
+
+            if (deferredContext) {
+                this.restart(
+                    deferredContext
+                );
+            }
+
+            return true;
+        };
+
     CurrentMatchHeroDamageMonitor.prototype.stop =
         function () {
             var hadState =
                 this._running ||
-                !!this._context;
+                !!this._context ||
+                !!this._deferredContext;
 
             this._running =
                 false;
@@ -167,6 +239,9 @@ var ThreatHud = ThreatHud || {};
                 1;
 
             this._context =
+                null;
+
+            this._deferredContext =
                 null;
 
             this._lastRequestedAccountIds =

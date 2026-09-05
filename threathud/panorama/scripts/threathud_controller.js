@@ -12,6 +12,8 @@ var ThreatHud = ThreatHud || {};
 	var DEBUG_ENABLED =
 	 false;
 
+	var MESSAGE_SERVICE_STATUS_ACK = 8;
+
 	function noopLog() {
 	}
 
@@ -307,7 +309,70 @@ var ThreatHud = ThreatHud || {};
 			matchRoster,
 			currentMatchStatsMonitor,
 			currentMatchHeroDamageMonitor,
-			hudMsg
+			hudMsg,
+			null,
+
+			function (
+				won,
+				observedAtUnixMs,
+				callback
+			) {
+				return localHostClient.requestPacket(
+					'current-match-result',
+
+					{
+						won:
+							won
+								? '1'
+								: '0',
+
+						observedAtUnixMs:
+							String(
+								observedAtUnixMs
+							)
+					},
+
+					function (
+						error,
+						packet
+					) {
+						if (typeof callback !== 'function') {
+							return;
+						}
+
+						if (error) {
+							callback(error, null);
+
+							return;
+						}
+
+						if (
+							!packet ||
+							packet.messageType !==
+								MESSAGE_SERVICE_STATUS_ACK ||
+							!packet.payload ||
+							packet.payload.length !== 1 ||
+							packet.payload[0] !== 1
+						) {
+							callback(
+								{
+									code:
+										'invalid-match-result-ack',
+
+									message:
+										'Bridge did not confirm match result.'
+								},
+
+								null
+							);
+
+							return;
+						}
+
+						callback(null, packet);
+					}
+				);
+			}
 		);
 
 	var moduleSettingsMonitor =

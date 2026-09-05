@@ -23,6 +23,7 @@ internal sealed class CurrentMatchLiveDamageService : IAsyncDisposable
     private CancellationTokenSource? _runCancellation;
     private Task? _runTask;
     private long _generation;
+    private ulong? _disabledMatchId;
     private DateTimeOffset? _lastSnapshotLogAtUtc;
     private CurrentMatchLiveDamageSnapshot _snapshot = CurrentMatchLiveDamageSnapshot.Waiting;
 
@@ -48,6 +49,7 @@ internal sealed class CurrentMatchLiveDamageService : IAsyncDisposable
             _runCancellation = null;
             _runTask = null;
             _generation++;
+            _disabledMatchId = null;
             _players.Clear();
             _lastSnapshotLogAtUtc = null;
             _snapshot = matchId == 0
@@ -59,6 +61,43 @@ internal sealed class CurrentMatchLiveDamageService : IAsyncDisposable
         _ = DisposeCompletedRunAsync(previousTask, previousCancellation);
     }
 
+    public bool DisableForMatch(ulong matchId)
+    {
+        CancellationTokenSource? previousCancellation;
+        Task? previousTask;
+
+        lock (_stateGate)
+        {
+            if (
+                matchId == 0 ||
+                _snapshot.MatchId != matchId ||
+                _disabledMatchId == matchId
+            )
+            {
+                return false;
+            }
+
+            _disabledMatchId = matchId;
+            _generation++;
+            previousCancellation = _runCancellation;
+            previousTask = _runTask;
+            _runCancellation = null;
+            _runTask = null;
+            _players.Clear();
+            _lastSnapshotLogAtUtc = null;
+            _snapshot = CurrentMatchLiveDamageSnapshot.ForMatch(matchId) with
+            {
+                Status = "disabled",
+                LastEventAtUtc = DateTimeOffset.UtcNow,
+                StatusMessage = "Hero Damage is disabled for this match"
+            };
+        }
+
+        Cancel(previousCancellation);
+        _ = DisposeCompletedRunAsync(previousTask, previousCancellation);
+        return true;
+    }
+
     public bool MarkScheduled(
         ulong matchId,
         DateTimeOffset heroStatsReadyAtUtc,
@@ -66,7 +105,12 @@ internal sealed class CurrentMatchLiveDamageService : IAsyncDisposable
     {
         lock (_stateGate)
         {
-            if (matchId == 0 || _snapshot.MatchId != matchId || _runTask is not null)
+            if (
+                matchId == 0 ||
+                _snapshot.MatchId != matchId ||
+                _disabledMatchId == matchId ||
+                _runTask is not null
+            )
             {
                 return false;
             }
@@ -94,7 +138,12 @@ internal sealed class CurrentMatchLiveDamageService : IAsyncDisposable
 
         lock (_stateGate)
         {
-            if (matchId == 0 || _snapshot.MatchId != matchId || _runTask is not null)
+            if (
+                matchId == 0 ||
+                _snapshot.MatchId != matchId ||
+                _disabledMatchId == matchId ||
+                _runTask is not null
+            )
             {
                 return false;
             }
@@ -144,7 +193,12 @@ internal sealed class CurrentMatchLiveDamageService : IAsyncDisposable
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             var parserPath = ResolveParserPath();
+
+            cancellationToken.ThrowIfCancellationRequested();
+
             process = new Process
             {
                 StartInfo = CreateStartInfo(parserPath, matchId, broadcastUrl),
@@ -156,6 +210,8 @@ internal sealed class CurrentMatchLiveDamageService : IAsyncDisposable
                 " | matchId=" + matchId +
                 " | parser=" + parserPath +
                 " | url=" + broadcastUrl);
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             if (!process.Start())
             {
@@ -1010,6 +1066,7 @@ internal sealed class CurrentMatchLiveDamageService : IAsyncDisposable
             cancellation = _runCancellation;
             _runTask = null;
             _runCancellation = null;
+            _disabledMatchId = null;
             _players.Clear();
             _snapshot = CurrentMatchLiveDamageSnapshot.Waiting;
         }

@@ -32,6 +32,9 @@ var ThreatHud = ThreatHud || {};
      */
     var WATCH_INTERVAL = 1.0;
 
+    var MATCH_RESULT_POLL_INTERVAL_MS = 1000;
+    var MAX_MATCH_RESULT_REPORT_ATTEMPTS = 10;
+
     var REDISCOVERY_DELAY = 0.25;
 
     /*
@@ -44,15 +47,34 @@ var ThreatHud = ThreatHud || {};
 
     var EARLY_RECHECK_WINDOW_MS =
         90000;
-        
+
+    function findHudPanel(panel) {
+        while (ThreatHud.PanelUtils.isValidPanel(panel)) {
+            if (panel.id === 'Hud') {
+                return panel;
+            }
+
+            if (typeof panel.GetParent !== 'function') {
+                return null;
+            }
+
+            panel = panel.GetParent();
+        }
+
+        return null;
+    }
 
     function MatchScreenMonitor(
         matchRoster,
         currentMatchStatsMonitor,
         currentMatchHeroDamageMonitor,
         logger,
-        onStableWindowReady
+        onStableWindowReady,
+        reportMatchResult
     ) {
+        var contextPanel = $.GetContextPanel();
+        var topPanel = ThreatHud.PanelUtils.getTopPanel(contextPanel);
+
         this._matchRoster = matchRoster;
         this._statsMonitor = currentMatchStatsMonitor;
         this._heroDamageMonitor =
@@ -78,6 +100,20 @@ var ThreatHud = ThreatHud || {};
                 ? logger
                 : function () {};
 
+        this._hudPanel = findHudPanel(contextPanel);
+
+        if (
+            !ThreatHud.PanelUtils.isValidPanel(this._hudPanel) &&
+            ThreatHud.PanelUtils.isValidPanel(topPanel)
+        ) {
+            this._hudPanel =
+                topPanel.id === 'Hud'
+                    ? topPanel
+                    : topPanel.FindChildTraverse('Hud');
+        }
+
+        this._spectatorMode = false;
+
         /*
         * Called once after:
         *
@@ -92,6 +128,21 @@ var ThreatHud = ThreatHud || {};
             typeof onStableWindowReady === 'function'
                 ? onStableWindowReady
                 : function () {};
+
+        this._reportMatchResult =
+            typeof reportMatchResult === 'function'
+                ? reportMatchResult
+                : null;
+
+        this._matchEndPanel = null;
+        this._matchResultReady = false;
+        this._matchResultSent = false;
+        this._matchResultPending = false;
+        this._matchResultLastPollMs = 0;
+        this._matchResultDetectedWon = null;
+        this._matchResultObservedAtUnixMs = 0;
+        this._matchResultReportAttempts = 0;
+        this._matchResultVersion = 0;
 
         /*
         * Prevent the callback from firing again
@@ -182,7 +233,10 @@ var ThreatHud = ThreatHud || {};
         this._pendingPresenceSnapshot = null;
         this._stableSnapshot = null;
         this._screenState = 'initial';
+        this._spectatorMode = false;
         this._stableWindowReadyFired = false;
+
+        this._resetMatchResultLifecycle();
 
         this._earlyRecheckDeadlineMs = 0;
 
@@ -218,7 +272,10 @@ var ThreatHud = ThreatHud || {};
         this._pendingPresenceSnapshot = null;
         this._stableSnapshot = null;
         this._screenState = 'initial';
+        this._spectatorMode = false;
         this._stableWindowReadyFired = false;
+
+        this._resetMatchResultLifecycle();
 
         this._earlyRecheckDeadlineMs = 0;
 
@@ -260,6 +317,19 @@ var ThreatHud = ThreatHud || {};
                     return;
                 }
 
+                if (self._holdForSpectatorMode()) {
+                    self._schedule(
+                        DISCOVERY_INTERVAL,
+                        generation
+                    );
+
+                    return;
+                }
+
+                self._pollMatchResult(
+                    generation
+                );
+
                 if (
                     self._mode ===
                     'watch'
@@ -287,6 +357,37 @@ var ThreatHud = ThreatHud || {};
                 );
             }
         );
+    };
+
+    MatchScreenMonitor.prototype._holdForSpectatorMode = function () {
+        var isSpectator =
+            ThreatHud.PanelUtils.isValidPanel(this._hudPanel) &&
+            typeof this._hudPanel.BHasClass === 'function' &&
+            this._hudPanel.BHasClass('TeamSpectator');
+
+        if (!isSpectator) {
+            this._spectatorMode = false;
+
+            return false;
+        }
+
+        if (this._spectatorMode) {
+            return true;
+        }
+
+        this._spectatorMode = true;
+        this._resetMatchResultLifecycle();
+        this._mode = 'discover';
+        this._candidateSnapshot = null;
+        this._candidateCount = 0;
+
+        this._acceptPresenceSnapshot(
+            this._createEmptyPresenceSnapshot()
+        );
+
+        this._matchRoster.invalidate();
+
+        return true;
     };
 
     /*
@@ -360,6 +461,18 @@ var ThreatHud = ThreatHud || {};
             this._matchRoster.getPlayerPanels(
                 'enemy'
             );
+
+        if (!ThreatHud.PanelUtils.isValidPanel(this._hudPanel)) {
+            this._hudPanel =
+                findHudPanel(
+                    allyPanels[0] ||
+                    enemyPanels[0]
+                );
+
+            if (this._holdForSpectatorMode()) {
+                return this._createEmptyPresenceSnapshot();
+            }
+        }
 
         if (
             allyPanels.length !== PLAYERS_PER_TEAM ||
@@ -460,6 +573,10 @@ var ThreatHud = ThreatHud || {};
             this._watchIndex = 0;
             this._cacheWaitCount = 0;
 
+            if (!this._spectatorMode) {
+                this._resetMatchResultLifecycle();
+            }
+
             /*
             * The full roster disappeared.
             *
@@ -512,6 +629,8 @@ var ThreatHud = ThreatHud || {};
             this._screenState ===
                 'no-roster'
         ) {
+            this._resetMatchResultLifecycle();
+
             this._matchSessionId +=
                 1;
 
@@ -622,6 +741,7 @@ var ThreatHud = ThreatHud || {};
             this._watchIndex = 0;
             this._mode = 'watch';
             this._screenState = 'roster';
+            this._matchResultReady = true;
 
             this._log(
                 'MatchScreenMonitor: ROSTER CACHE READY' +
@@ -798,6 +918,196 @@ var ThreatHud = ThreatHud || {};
             REDISCOVERY_DELAY,
             generation
         );
+    };
+
+    MatchScreenMonitor.prototype._resetMatchResultLifecycle =
+        function () {
+            this._matchEndPanel = null;
+            this._matchResultReady = false;
+            this._matchResultSent = false;
+            this._matchResultPending = false;
+            this._matchResultLastPollMs = 0;
+            this._matchResultDetectedWon = null;
+            this._matchResultObservedAtUnixMs = 0;
+            this._matchResultReportAttempts = 0;
+            this._matchResultVersion += 1;
+        };
+
+    MatchScreenMonitor.prototype._getMatchEndPanel = function () {
+        if (
+            ThreatHud.PanelUtils.isValidPanel(
+                this._matchEndPanel
+            )
+        ) {
+            return this._matchEndPanel;
+        }
+
+        this._matchEndPanel = null;
+
+        if (
+            !ThreatHud.PanelUtils.isValidPanel(this._hudPanel) ||
+            typeof this._hudPanel.FindChildTraverse !== 'function'
+        ) {
+            return null;
+        }
+
+        this._matchEndPanel =
+            this._hudPanel.FindChildTraverse('MatchEnd');
+
+        return ThreatHud.PanelUtils.isValidPanel(
+            this._matchEndPanel
+        )
+            ? this._matchEndPanel
+            : null;
+    };
+
+    MatchScreenMonitor.prototype._pollMatchResult = function (
+        generation
+    ) {
+        var now;
+        var matchEndPanel;
+        var team1Victory;
+        var team2Victory;
+        var localPlayerTeam1;
+        var localPlayerTeam2;
+        var won;
+        var sessionId;
+        var resultVersion;
+        var self;
+        var started;
+
+        if (
+            !this._matchResultReady ||
+            this._matchResultSent ||
+            this._matchResultPending ||
+            !this._reportMatchResult
+        ) {
+            return;
+        }
+
+        now = new Date().getTime();
+
+        if (
+            this._matchResultLastPollMs > 0 &&
+            now - this._matchResultLastPollMs <
+                MATCH_RESULT_POLL_INTERVAL_MS
+        ) {
+            return;
+        }
+
+        this._matchResultLastPollMs = now;
+
+        if (this._matchResultDetectedWon === null) {
+            matchEndPanel = this._getMatchEndPanel();
+
+            if (
+                !matchEndPanel ||
+                typeof matchEndPanel.BHasClass !== 'function' ||
+                !matchEndPanel.BHasClass('ShowMatchEnd') ||
+                !matchEndPanel.BHasClass('MatchFinished')
+            ) {
+                return;
+            }
+
+            team1Victory =
+                matchEndPanel.BHasClass('Team1Victory');
+            team2Victory =
+                matchEndPanel.BHasClass('Team2Victory');
+            localPlayerTeam1 =
+                matchEndPanel.BHasClass('LocalPlayerTeam1');
+            localPlayerTeam2 =
+                matchEndPanel.BHasClass('LocalPlayerTeam2');
+
+            if (
+                team1Victory === team2Victory ||
+                localPlayerTeam1 === localPlayerTeam2
+            ) {
+                return;
+            }
+
+            this._matchResultDetectedWon =
+                (team1Victory && localPlayerTeam1) ||
+                (team2Victory && localPlayerTeam2);
+            this._matchResultObservedAtUnixMs = now;
+        }
+
+        won = this._matchResultDetectedWon;
+
+        if (
+            this._matchResultReportAttempts >=
+            MAX_MATCH_RESULT_REPORT_ATTEMPTS
+        ) {
+            this._matchResultSent = true;
+
+            this._log(
+                'MatchScreenMonitor: MATCH RESULT GAVE UP'
+            );
+
+            return;
+        }
+
+        this._matchResultPending = true;
+        this._matchResultReportAttempts += 1;
+        sessionId = this._matchSessionId;
+        resultVersion = this._matchResultVersion;
+        self = this;
+
+        try {
+            started = this._reportMatchResult(
+                won,
+                this._matchResultObservedAtUnixMs,
+
+                function (error) {
+                    if (
+                        !self._running ||
+                        generation !== self._generation ||
+                        sessionId !== self._matchSessionId ||
+                        resultVersion !== self._matchResultVersion
+                    ) {
+                        return;
+                    }
+
+                    self._matchResultPending = false;
+
+                    if (error) {
+                        self._log(
+                            'MatchScreenMonitor: MATCH RESULT ERROR'
+                        );
+
+                        return;
+                    }
+
+                    self._matchResultSent = true;
+
+                    self._log(
+                        'MatchScreenMonitor: MATCH RESULT SENT' +
+                        ' | won=' + (won ? '1' : '0')
+                    );
+                }
+            );
+
+            if (
+                started === false &&
+                generation === this._generation &&
+                sessionId === this._matchSessionId &&
+                resultVersion === this._matchResultVersion &&
+                !this._matchResultSent
+            ) {
+                this._matchResultPending = false;
+            }
+        } catch (error) {
+            if (
+                generation === this._generation &&
+                sessionId === this._matchSessionId &&
+                resultVersion === this._matchResultVersion
+            ) {
+                this._matchResultPending = false;
+            }
+
+            this._log(
+                'MatchScreenMonitor: MATCH RESULT ERROR'
+            );
+        }
     };
 
     MatchScreenMonitor.prototype._nextInterval = function () {

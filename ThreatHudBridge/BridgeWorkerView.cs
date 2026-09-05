@@ -32,6 +32,58 @@ internal sealed class BridgeWorkerView :
         }
     }
 
+    public static bool TryClearLogFile()
+    {
+        try
+        {
+            var path =
+                LogFilePath;
+
+            var directory =
+                Path.GetDirectoryName(
+                    path
+                );
+
+            if (
+                !String.IsNullOrWhiteSpace(
+                    directory
+                )
+            )
+            {
+                Directory.CreateDirectory(
+                    directory
+                );
+            }
+
+            using var stream =
+                new FileStream(
+                    path,
+                    FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.None
+                );
+
+            return true;
+        }
+        catch (
+            IOException
+        )
+        {
+            /*
+             * Do not truncate a log that is still owned by another Bridge or
+             * orphan worker process, and do not prevent this Bridge from
+             * opening solely because the old log is locked.
+             */
+            return false;
+        }
+        catch (
+            UnauthorizedAccessException
+        )
+        {
+            return false;
+        }
+    }
+
     public BridgeWorkerView()
     {
         var path =

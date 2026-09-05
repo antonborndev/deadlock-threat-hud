@@ -25,6 +25,13 @@ internal static class Program
                 .GetResult();
         }
 
+        /*
+         * Clear the persistent worker log once per desktop Bridge launch.
+         * Worker processes return above, so restarts during this desktop
+         * session continue appending instead of erasing earlier diagnostics.
+         */
+        _ = BridgeWorkerView.TryClearLogFile();
+
         ApplicationConfiguration.Initialize();
 
         using var applicationContext =

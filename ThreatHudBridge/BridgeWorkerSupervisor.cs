@@ -69,6 +69,8 @@ internal sealed class BridgeWorkerSupervisor :
     private BridgeServiceStatusSnapshot?
         _lastServiceStatuses;
 
+    private bool? _lastHasCurrentMatch;
+
     private long _nextMatchPlayerDetailsPollAt;
 
     private bool _disposed;
@@ -575,6 +577,10 @@ internal sealed class BridgeWorkerSupervisor :
                 }
                 else
                 {
+                    ApplyHasCurrentMatch(
+                        health.HasCurrentMatch
+                    );
+
                     ApplyServiceStatuses(
                         health.HasCurrentMatch
                             ? health.ServiceStatuses
@@ -855,7 +861,11 @@ internal sealed class BridgeWorkerSupervisor :
             !accountIdElement
                 .TryGetUInt32(
                     out var accountId
-                )
+                ) ||
+            !TryReadHasCurrentMatch(
+                document.RootElement,
+                out var hasCurrentMatch
+            )
         )
         {
             return null;
@@ -863,19 +873,21 @@ internal sealed class BridgeWorkerSupervisor :
 
         return new HealthSnapshot(
             accountId,
-            ReadHasCurrentMatch(
-                document.RootElement
-            ),
+            hasCurrentMatch,
             ReadServiceStatuses(
                 document.RootElement
             )
         );
     }
 
-    private static bool ReadHasCurrentMatch(
-        JsonElement root
+    private static bool TryReadHasCurrentMatch(
+        JsonElement root,
+        out bool hasCurrentMatch
     )
     {
+        hasCurrentMatch =
+            false;
+
         if (
             !root.TryGetProperty(
                 "hasCurrentMatch",
@@ -886,17 +898,20 @@ internal sealed class BridgeWorkerSupervisor :
             return false;
         }
 
-        return value.ValueKind switch
+        switch (value.ValueKind)
         {
-            JsonValueKind.True =>
-                true,
+            case JsonValueKind.True:
+                hasCurrentMatch =
+                    true;
 
-            JsonValueKind.False =>
-                false,
+                return true;
 
-            _ =>
-                false
-        };
+            case JsonValueKind.False:
+                return true;
+
+            default:
+                return false;
+        }
     }
 
     private static BridgeServiceStatusSnapshot
@@ -1077,6 +1092,10 @@ internal sealed class BridgeWorkerSupervisor :
 
     private void SetInactiveState()
     {
+        ApplyHasCurrentMatch(
+            false
+        );
+
         ApplyServiceStatuses(
             null
         );
@@ -1128,6 +1147,38 @@ internal sealed class BridgeWorkerSupervisor :
         _view.SetServiceStates(
             snapshot
         );
+    }
+
+    private void ApplyHasCurrentMatch(
+        bool hasCurrentMatch
+    )
+    {
+        if (
+            _lastHasCurrentMatch ==
+                hasCurrentMatch
+        )
+        {
+            return;
+        }
+
+        _lastHasCurrentMatch =
+            hasCurrentMatch;
+
+        _view.SetHasCurrentMatch(
+            hasCurrentMatch
+        );
+
+        if (!hasCurrentMatch)
+        {
+            /*
+             * Clear the previous roster immediately. The details endpoint may
+             * be briefly unavailable exactly when a match ends, and hidden
+             * stale rows must not flash when the next match begins.
+             */
+            _view.SetMatchPlayerDetails(
+                MatchPlayerDetailsUiState.Waiting
+            );
+        }
     }
 
     private static bool IsProcessRunning(

@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -18,15 +19,25 @@ internal sealed record ThreatHudModStatus(
 {
     public bool IsDeadlockLocated =>
         !String.IsNullOrWhiteSpace(DeadlockDirectory);
+
+    public bool IsUpdateAvailable =>
+        IsInstalled &&
+        !IsCurrentPayload;
+
+    // Kept as an alias so UI code can describe the intent without changing
+    // the positional record contract used by older Bridge sources.
+    public string? VpkBlockReason => VpkError;
 }
 
 internal sealed class ThreatHudModManagerService
 {
     private const string DeadlockProcessName = "deadlock";
     private const string DeadlockAppId = "1422450";
-    private const string InstalledVpkFileName = "pak57_dir.vpk";
-    private const string InstalledHashFileName =
-        "pak57_dir.vpk.threathud.sha256";
+    private const int FirstVpkNumber = 1;
+    private const int LastVpkNumber = 99;
+    private const int LegacyVpkNumber = 57;
+    private const string OwnershipMarkerSuffix =
+        ".threathud.sha256";
     private const string EmbeddedVpkResourceName =
         "ThreatHudBridge.Resources.pak57_dir.vpk";
     private const uint VpkSignature = 0x55AA1234;
@@ -45,6 +56,16 @@ internal sealed class ThreatHudModManagerService
 
     private static readonly Regex InstallDirectoryPattern = new(
         @"""installdir""\s+""(?<value>(?:\\.|[^""])*)""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
+    );
+
+    private static readonly Regex InstalledVpkFilePattern = new(
+        @"\Apak(?<number>[0-9]{2})_dir\.vpk\z",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
+    );
+
+    private static readonly Regex OwnershipMarkerFilePattern = new(
+        @"\Apak(?<number>[0-9]{2})_dir\.vpk\.threathud\.sha256\z",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
     );
 
@@ -73,6 +94,14 @@ internal sealed class ThreatHudModManagerService
             cancellationToken
         );
 
+    public Task UpdateAsync(
+        CancellationToken cancellationToken = default
+    ) =>
+        RunExclusiveAsync(
+            () => InstallCoreAsync(cancellationToken),
+            cancellationToken
+        );
+
     private async Task InstallCoreAsync(
         CancellationToken cancellationToken
     )
@@ -88,36 +117,34 @@ internal sealed class ThreatHudModManagerService
 
         Directory.CreateDirectory(paths.AddonsDirectory);
 
-        var ownership = await Task.Run(
-            () => InspectInstalledVpk(paths, cancellationToken),
+        var inventory = await Task.Run(
+            () => InspectVpkInventory(paths, cancellationToken),
             cancellationToken
         );
 
-        if (ownership.Exists && !ownership.IsOwned)
-        {
-            throw new InvalidOperationException(
-                $"Another file already uses {InstalledVpkFileName}. " +
-                "Threat HUD Bridge will not overwrite it."
-            );
-        }
+        ThrowIfVpkBlocked(inventory);
 
-        if (ownership.Exists)
+        var installedMod =
+            inventory.ManagedCandidates.SingleOrDefault();
+
+        if (
+            installedMod is not null &&
+            installedMod.IsCurrentPayload
+        )
         {
-            if (ownership.IsCurrentPayload)
+            if (!installedMod.HasOwnershipMarker)
             {
-                EnsureDeadlockIsStopped();
-
-                WriteTextAtomically(
-                    paths.InstalledHashPath,
-                    GetEmbeddedVpkHash() + Environment.NewLine
+                await Task.Run(
+                    () => AdoptLegacyOwnershipMarkerCore(
+                        paths,
+                        installedMod,
+                        cancellationToken
+                    ),
+                    cancellationToken
                 );
-                return;
             }
 
-            throw new InvalidOperationException(
-                "An older Threat HUD VPK is installed. " +
-                "Uninstall it before installing this build."
-            );
+            return;
         }
 
         var embeddedHash = await Task.Run(
@@ -126,7 +153,7 @@ internal sealed class ThreatHudModManagerService
         );
         var temporaryPath = Path.Combine(
             paths.AddonsDirectory,
-            $".{InstalledVpkFileName}.{Guid.NewGuid():N}.tmp"
+            $".threathud.{Guid.NewGuid():N}.vpk.tmp"
         );
 
         try
@@ -170,20 +197,424 @@ internal sealed class ThreatHudModManagerService
             }
 
             EnsureDeadlockIsStopped();
-
-            File.Move(
-                temporaryPath,
-                paths.InstalledVpkPath,
-                overwrite: false
-            );
-            WriteTextAtomically(
-                paths.InstalledHashPath,
-                embeddedHash + Environment.NewLine
+            await Task.Run(
+                () => CommitPreparedVpkCore(
+                    paths,
+                    temporaryPath,
+                    installedMod,
+                    embeddedHash,
+                    cancellationToken
+                ),
+                cancellationToken
             );
         }
         finally
         {
             TryDeleteFile(temporaryPath);
+        }
+    }
+
+    private void CommitPreparedVpkCore(
+        DeadlockPaths paths,
+        string preparedVpkPath,
+        ManagedVpkCandidate? originallyInstalledMod,
+        string embeddedHash,
+        CancellationToken cancellationToken
+    )
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureDeadlockIsStopped();
+
+        // Re-scan immediately before the first rename. File.Move(false)
+        // remains the final guard if another process wins the race after it.
+        var currentInventory = InspectVpkInventory(
+            paths,
+            cancellationToken
+        );
+        ThrowIfVpkBlocked(currentInventory);
+
+        if (originallyInstalledMod is null)
+        {
+            if (currentInventory.ManagedCandidates.Count != 0)
+            {
+                throw new InvalidOperationException(
+                    "The VPK installation changed while the new mod was " +
+                    "being prepared. No files were changed."
+                );
+            }
+
+            InstallFreshVpkCore(
+                paths,
+                preparedVpkPath,
+                currentInventory,
+                embeddedHash,
+                cancellationToken
+            );
+            return;
+        }
+
+        if (currentInventory.ManagedCandidates.Count != 1)
+        {
+            throw new InvalidOperationException(
+                "The installed Threat HUD VPK changed while the update " +
+                "was being prepared. No files were changed."
+            );
+        }
+
+        var currentMod = currentInventory.ManagedCandidates[0];
+        if (!IsSameManagedVpk(originallyInstalledMod, currentMod))
+        {
+            throw new InvalidOperationException(
+                "The installed Threat HUD VPK changed while the update " +
+                "was being prepared. No files were changed."
+            );
+        }
+
+        if (currentMod.IsCurrentPayload)
+        {
+            return;
+        }
+
+        UpdateInstalledVpkCore(
+            preparedVpkPath,
+            currentMod,
+            embeddedHash,
+            cancellationToken
+        );
+    }
+
+    private void InstallFreshVpkCore(
+        DeadlockPaths paths,
+        string preparedVpkPath,
+        VpkInventory inventory,
+        string embeddedHash,
+        CancellationToken cancellationToken
+    )
+    {
+        var targetNumber = inventory.NextInstallNumber ??
+            throw new InvalidOperationException(
+                CreateNoAvailableVpkSlotMessage()
+            );
+        var vpkPath = Path.Combine(
+            paths.AddonsDirectory,
+            FormatVpkFileName(targetNumber)
+        );
+        var markerPath = vpkPath + OwnershipMarkerSuffix;
+        var rollbackPath = Path.Combine(
+            paths.AddonsDirectory,
+            $".{Path.GetFileName(vpkPath)}.{Guid.NewGuid():N}.rollback"
+        );
+        var payloadInstalled = false;
+
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureDeadlockIsStopped();
+
+        // Never overwrite either another mod or another ownership marker.
+        File.Move(preparedVpkPath, vpkPath, overwrite: false);
+        payloadInstalled = true;
+
+        try
+        {
+            WriteNewTextAtomically(
+                markerPath,
+                embeddedHash + Environment.NewLine
+            );
+        }
+        catch (Exception operationError)
+        {
+            try
+            {
+                if (!payloadInstalled || !File.Exists(vpkPath))
+                {
+                    throw new FileNotFoundException(
+                        "The newly installed VPK is missing.",
+                        vpkPath
+                    );
+                }
+
+                File.Move(vpkPath, rollbackPath, overwrite: false);
+                var rollbackHash = CalculateFileHash(
+                    rollbackPath,
+                    CancellationToken.None
+                );
+                if (!String.Equals(
+                    rollbackHash,
+                    embeddedHash,
+                    StringComparison.OrdinalIgnoreCase
+                ))
+                {
+                    throw new IOException(
+                        "The new VPK changed during marker rollback. " +
+                        "The unexpected file was preserved at: " +
+                        rollbackPath
+                    );
+                }
+
+                File.Delete(rollbackPath);
+            }
+            catch (Exception rollbackError)
+            {
+                var preservedPath = File.Exists(rollbackPath)
+                    ? rollbackPath
+                    : vpkPath;
+                throw new IOException(
+                    "The ownership marker could not be created and the " +
+                    "new VPK could not be rolled back completely. " +
+                    "Preserved VPK location: " + preservedPath,
+                    new AggregateException(operationError, rollbackError)
+                );
+            }
+
+            throw;
+        }
+    }
+
+    private void UpdateInstalledVpkCore(
+        string preparedVpkPath,
+        ManagedVpkCandidate installedMod,
+        string embeddedHash,
+        CancellationToken cancellationToken
+    )
+    {
+        var expectedInstalledHash = installedMod.InstalledHash;
+
+        var quarantinePath =
+            Path.Combine(
+                Path.GetDirectoryName(installedMod.VpkPath)!,
+                $".{Path.GetFileName(installedMod.VpkPath)}." +
+                $"{Guid.NewGuid():N}.updating"
+            );
+        var markerQuarantinePath =
+            Path.Combine(
+                Path.GetDirectoryName(installedMod.MarkerPath)!,
+                $".{Path.GetFileName(installedMod.MarkerPath)}." +
+                $"{Guid.NewGuid():N}.updating"
+            );
+
+        var failedPayloadPath =
+            Path.Combine(
+                Path.GetDirectoryName(installedMod.VpkPath)!,
+                $".{Path.GetFileName(installedMod.VpkPath)}." +
+                $"{Guid.NewGuid():N}.update-failed"
+            );
+
+        var markerQuarantined = false;
+        var newPayloadInstalled = false;
+
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureDeadlockIsStopped();
+
+        File.Move(
+            installedMod.VpkPath,
+            quarantinePath,
+            overwrite: false
+        );
+
+        try
+        {
+            var quarantinedHash =
+                CalculateFileHash(
+                    quarantinePath,
+                    cancellationToken
+                );
+
+            if (!String.Equals(
+                quarantinedHash,
+                expectedInstalledHash,
+                StringComparison.OrdinalIgnoreCase
+            ))
+            {
+                throw new InvalidOperationException(
+                    "The installed VPK changed while the update was " +
+                    "being prepared. The update was canceled."
+                );
+            }
+
+            var currentRecordedHash = ReadRecordedHashStrict(
+                installedMod.MarkerPath
+            );
+            if (!String.Equals(
+                currentRecordedHash,
+                expectedInstalledHash,
+                StringComparison.OrdinalIgnoreCase
+            ))
+            {
+                throw new InvalidOperationException(
+                    "The ownership marker changed while the update was " +
+                    "being prepared. The update was canceled."
+                );
+            }
+
+            File.Move(
+                installedMod.MarkerPath,
+                markerQuarantinePath,
+                overwrite: false
+            );
+            markerQuarantined = true;
+
+            var quarantinedRecordedHash = ReadRecordedHashStrict(
+                markerQuarantinePath
+            );
+            if (!String.Equals(
+                quarantinedRecordedHash,
+                expectedInstalledHash,
+                StringComparison.OrdinalIgnoreCase
+            ))
+            {
+                throw new InvalidOperationException(
+                    "The ownership marker changed while the update was " +
+                    "being prepared. The update was canceled."
+                );
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            EnsureDeadlockIsStopped();
+
+            File.Move(
+                preparedVpkPath,
+                installedMod.VpkPath,
+                overwrite: false
+            );
+
+            newPayloadInstalled = true;
+
+            /*
+             * Do not observe cancellation between installing the new VPK
+             * and committing its ownership hash. Otherwise the next Bridge
+             * build could mistake this payload for an unrelated mod.
+             */
+            WriteNewTextAtomically(
+                installedMod.MarkerPath,
+                embeddedHash + Environment.NewLine
+            );
+
+            TryDeleteFile(quarantinePath);
+            TryDeleteFile(markerQuarantinePath);
+        }
+        catch (Exception operationError)
+        {
+            try
+            {
+                if (newPayloadInstalled)
+                {
+                    if (
+                        !File.Exists(
+                            installedMod.VpkPath
+                        )
+                    )
+                    {
+                        throw new IOException(
+                            "The newly installed VPK is missing."
+                        );
+                    }
+
+                    File.Move(
+                        installedMod.VpkPath,
+                        failedPayloadPath,
+                        overwrite: false
+                    );
+
+                    var failedPayloadHash =
+                        CalculateFileHash(
+                            failedPayloadPath,
+                            CancellationToken.None
+                        );
+
+                    if (
+                        !String.Equals(
+                            failedPayloadHash,
+                            embeddedHash,
+                            StringComparison.OrdinalIgnoreCase
+                        )
+                    )
+                    {
+                        throw new IOException(
+                            "The VPK path changed during update rollback. " +
+                            "The unexpected file was preserved at: " +
+                            failedPayloadPath
+                        );
+                    }
+                }
+
+                if (
+                    File.Exists(
+                        installedMod.VpkPath
+                    )
+                )
+                {
+                    throw new IOException(
+                        "The original VPK path is occupied."
+                    );
+                }
+
+                if (!File.Exists(quarantinePath))
+                {
+                    throw new FileNotFoundException(
+                        "The preserved previous VPK is missing.",
+                        quarantinePath
+                    );
+                }
+
+                File.Move(
+                    quarantinePath,
+                    installedMod.VpkPath,
+                    overwrite: false
+                );
+                if (markerQuarantined)
+                {
+                    if (File.Exists(installedMod.MarkerPath))
+                    {
+                        throw new IOException(
+                            "The original ownership marker path is occupied."
+                        );
+                    }
+
+                    File.Move(
+                        markerQuarantinePath,
+                        installedMod.MarkerPath,
+                        overwrite: false
+                    );
+                    markerQuarantined = false;
+                }
+
+                TryDeleteFile(
+                    failedPayloadPath
+                );
+            }
+            catch (Exception restoreError)
+            {
+                var previousVpkLocation =
+                    File.Exists(quarantinePath)
+                        ? quarantinePath
+                        : installedMod.VpkPath;
+
+                var previousMarkerLocation =
+                    File.Exists(markerQuarantinePath)
+                        ? markerQuarantinePath
+                        : installedMod.MarkerPath;
+
+                var failedPayloadDetail =
+                    File.Exists(failedPayloadPath)
+                        ? " The file found at the VPK path was preserved at: " +
+                          failedPayloadPath
+                        : String.Empty;
+
+                throw new IOException(
+                    "The update was aborted, but the previous mod state " +
+                    "could not be restored completely. Previous VPK " +
+                    "location: " +
+                    previousVpkLocation +
+                    ". Previous marker location: " +
+                    previousMarkerLocation +
+                    failedPayloadDetail,
+                    new AggregateException(
+                        operationError,
+                        restoreError
+                    )
+                );
+            }
+
+            throw;
         }
     }
 
@@ -225,35 +656,85 @@ internal sealed class ThreatHudModManagerService
     {
         EnsureDeadlockIsStopped();
         var paths = RequireDeadlockPaths();
-        var ownership = InspectInstalledVpk(paths, cancellationToken);
+        var inventory = InspectVpkInventory(paths, cancellationToken);
+        ThrowIfVpkBlocked(inventory);
 
-        if (!ownership.Exists)
+        if (inventory.ManagedCandidates.Count == 0)
         {
-            TryDeleteFile(paths.InstalledHashPath);
             return;
         }
 
-        if (!ownership.IsOwned)
+        var installedMod = inventory.ManagedCandidates.Single();
+
+        if (!installedMod.HasOwnershipMarker)
         {
-            throw new InvalidOperationException(
-                $"{InstalledVpkFileName} is not owned by " +
-                "Threat HUD Bridge and will not be deleted."
+            AdoptLegacyOwnershipMarkerCore(
+                paths,
+                installedMod,
+                cancellationToken
             );
+            inventory = InspectVpkInventory(paths, cancellationToken);
+            ThrowIfVpkBlocked(inventory);
+
+            if (inventory.ManagedCandidates.Count != 1)
+            {
+                throw new InvalidOperationException(
+                    "The installed Threat HUD VPK changed while its " +
+                    "legacy ownership marker was being created."
+                );
+            }
+
+            installedMod = inventory.ManagedCandidates[0];
+            if (!installedMod.HasOwnershipMarker)
+            {
+                throw new InvalidOperationException(
+                    "The legacy Threat HUD VPK ownership marker could " +
+                    "not be verified."
+                );
+            }
         }
 
         cancellationToken.ThrowIfCancellationRequested();
         EnsureDeadlockIsStopped();
 
+        // Re-scan immediately before renaming either owned file.
+        var currentInventory = InspectVpkInventory(
+            paths,
+            cancellationToken
+        );
+        ThrowIfVpkBlocked(currentInventory);
+        if (
+            currentInventory.ManagedCandidates.Count != 1 ||
+            !IsSameManagedVpk(
+                installedMod,
+                currentInventory.ManagedCandidates[0]
+            )
+        )
+        {
+            throw new InvalidOperationException(
+                "The installed Threat HUD VPK changed while uninstall " +
+                "was being prepared. No files were changed."
+            );
+        }
+
         var quarantinePath = Path.Combine(
             paths.AddonsDirectory,
-            $".{InstalledVpkFileName}.{Guid.NewGuid():N}.uninstalling"
+            $".{Path.GetFileName(installedMod.VpkPath)}." +
+            $"{Guid.NewGuid():N}.uninstalling"
+        );
+        var markerQuarantinePath = Path.Combine(
+            paths.AddonsDirectory,
+            $".{Path.GetFileName(installedMod.MarkerPath)}." +
+            $"{Guid.NewGuid():N}.uninstalling"
         );
 
         File.Move(
-            paths.InstalledVpkPath,
+            installedMod.VpkPath,
             quarantinePath,
             overwrite: false
         );
+
+        var markerQuarantined = false;
 
         try
         {
@@ -261,33 +742,63 @@ internal sealed class ThreatHudModManagerService
                 quarantinePath,
                 cancellationToken
             );
-            var embeddedHash = GetEmbeddedVpkHash();
-            var recordedHash = TryReadRecordedHash(
-                paths.InstalledHashPath
-            );
-            var isOwned = String.Equals(
-                    quarantinedHash,
-                    embeddedHash,
-                    StringComparison.OrdinalIgnoreCase
-                ) ||
-                String.Equals(
-                    quarantinedHash,
-                    recordedHash,
-                    StringComparison.OrdinalIgnoreCase
-                );
-
-            if (!isOwned)
+            if (!String.Equals(
+                quarantinedHash,
+                installedMod.InstalledHash,
+                StringComparison.OrdinalIgnoreCase
+            ))
             {
                 throw new InvalidOperationException(
-                    $"{InstalledVpkFileName} is not owned by " +
-                    "Threat HUD Bridge and will not be deleted."
+                    "The installed Threat HUD VPK changed while it was " +
+                    "being prepared for uninstall."
+                );
+            }
+
+            var recordedHash = ReadRecordedHashStrict(
+                installedMod.MarkerPath
+            );
+            if (!String.Equals(
+                recordedHash,
+                installedMod.InstalledHash,
+                StringComparison.OrdinalIgnoreCase
+            ))
+            {
+                throw new InvalidOperationException(
+                    "The ownership marker changed while uninstall was " +
+                    "being prepared."
+                );
+            }
+
+            File.Move(
+                installedMod.MarkerPath,
+                markerQuarantinePath,
+                overwrite: false
+            );
+            markerQuarantined = true;
+
+            var quarantinedRecordedHash = ReadRecordedHashStrict(
+                markerQuarantinePath
+            );
+            if (!String.Equals(
+                quarantinedRecordedHash,
+                installedMod.InstalledHash,
+                StringComparison.OrdinalIgnoreCase
+            ))
+            {
+                throw new InvalidOperationException(
+                    "The ownership marker changed while uninstall was " +
+                    "being prepared."
                 );
             }
 
             cancellationToken.ThrowIfCancellationRequested();
             EnsureDeadlockIsStopped();
+
+            // Once both files have unique quarantine names, the visible
+            // install is gone. Cleanup failures can safely leave only hidden
+            // Bridge quarantine files and must not touch foreign pakNN files.
             File.Delete(quarantinePath);
-            TryDeleteFile(paths.InstalledHashPath);
+            TryDeleteFile(markerQuarantinePath);
         }
         catch (Exception operationError)
         {
@@ -295,7 +806,7 @@ internal sealed class ThreatHudModManagerService
             {
                 try
                 {
-                    if (File.Exists(paths.InstalledVpkPath))
+                    if (File.Exists(installedMod.VpkPath))
                     {
                         throw new IOException(
                             "The original VPK path is occupied."
@@ -304,9 +815,25 @@ internal sealed class ThreatHudModManagerService
 
                     File.Move(
                         quarantinePath,
-                        paths.InstalledVpkPath,
+                        installedMod.VpkPath,
                         overwrite: false
                     );
+
+                    if (markerQuarantined)
+                    {
+                        if (File.Exists(installedMod.MarkerPath))
+                        {
+                            throw new IOException(
+                                "The ownership marker path is occupied."
+                            );
+                        }
+
+                        File.Move(
+                            markerQuarantinePath,
+                            installedMod.MarkerPath,
+                            overwrite: false
+                        );
+                    }
                 }
                 catch (Exception restoreError) when (
                     restoreError is IOException or
@@ -316,7 +843,10 @@ internal sealed class ThreatHudModManagerService
                     throw new IOException(
                         "The uninstall was aborted, but the VPK could not " +
                         "be restored automatically. The preserved file is: " +
-                        quarantinePath,
+                        quarantinePath +
+                        (File.Exists(markerQuarantinePath)
+                            ? ". Preserved marker: " + markerQuarantinePath
+                            : String.Empty),
                         new AggregateException(
                             operationError,
                             restoreError
@@ -497,14 +1027,15 @@ internal sealed class ThreatHudModManagerService
         }
 
         var paths = CreateDeadlockPaths(deadlockDirectory);
-        var ownership = new InstalledVpkOwnership(false, false, false);
+        VpkInventory? inventory = null;
         string? vpkError = null;
         var isActive = false;
         string? activationError = null;
 
         try
         {
-            ownership = InspectInstalledVpk(paths, cancellationToken);
+            inventory = InspectVpkInventory(paths, cancellationToken);
+            vpkError = inventory.BlockReason;
         }
         catch (Exception error) when (
             error is IOException or
@@ -515,6 +1046,23 @@ internal sealed class ThreatHudModManagerService
         )
         {
             vpkError = error.Message;
+        }
+
+        try
+        {
+            // Validate the embedded payload during status refresh so a
+            // missing/corrupt resource disables the button with a reason,
+            // instead of failing only after the user clicks Install.
+            _ = GetEmbeddedVpkHash();
+        }
+        catch (Exception error) when (
+            error is IOException or
+            InvalidDataException or
+            InvalidOperationException or
+            CryptographicException
+        )
+        {
+            vpkError = CombineBlockReasons(vpkError, error.Message);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -535,12 +1083,17 @@ internal sealed class ThreatHudModManagerService
             activationError = error.Message;
         }
 
+        var installedMod =
+            inventory is { ManagedCandidates.Count: 1 }
+                ? inventory.ManagedCandidates[0]
+                : null;
+
         return new ThreatHudModStatus(
             deadlockDirectory,
-            ownership.Exists && ownership.IsOwned,
+            installedMod is not null,
             isActive,
-            ownership.Exists && !ownership.IsOwned,
-            ownership.IsCurrentPayload,
+            inventory?.HasOwnershipConflict == true,
+            installedMod?.IsCurrentPayload == true,
             vpkError,
             activationError
         );
@@ -615,35 +1168,450 @@ internal sealed class ThreatHudModManagerService
         }
     }
 
-    private InstalledVpkOwnership InspectInstalledVpk(
+    private VpkInventory InspectVpkInventory(
         DeadlockPaths paths,
         CancellationToken cancellationToken
     )
     {
-        if (!File.Exists(paths.InstalledVpkPath))
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (File.Exists(paths.AddonsDirectory))
         {
-            return new InstalledVpkOwnership(false, false, false);
+            throw new IOException(
+                "The Deadlock addons path is occupied by a file: " +
+                paths.AddonsDirectory
+            );
         }
 
-        var installedHash =
-            CalculateFileHash(paths.InstalledVpkPath, cancellationToken);
-        var embeddedHash = GetEmbeddedVpkHash();
-        var recordedHash = TryReadRecordedHash(paths.InstalledHashPath);
-        var isCurrentPayload = String.Equals(
-            installedHash,
-            embeddedHash,
-            StringComparison.OrdinalIgnoreCase
+        if (!Directory.Exists(paths.AddonsDirectory))
+        {
+            return new VpkInventory(
+                Array.Empty<NamedVpkFile>(),
+                Array.Empty<ManagedVpkCandidate>(),
+                FirstVpkNumber,
+                false,
+                null
+            );
+        }
+
+        var allFiles = Directory.EnumerateFiles(
+            paths.AddonsDirectory,
+            "*",
+            SearchOption.TopDirectoryOnly
+        ).ToArray();
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var vpkFiles = new List<NamedVpkFile>();
+        var markerFiles = new List<NamedMarkerFile>();
+
+        foreach (var path in allFiles)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fileName = Path.GetFileName(path);
+            if (String.IsNullOrEmpty(fileName))
+            {
+                continue;
+            }
+
+            if (TryParseVpkFileName(fileName, out var vpkNumber))
+            {
+                vpkFiles.Add(new NamedVpkFile(vpkNumber, path));
+                continue;
+            }
+
+            if (TryParseOwnershipMarkerFileName(
+                fileName,
+                out var markerNumber
+            ))
+            {
+                markerFiles.Add(new NamedMarkerFile(markerNumber, path));
+            }
+        }
+
+        var problems = new List<string>();
+        var managedCandidates = new List<ManagedVpkCandidate>();
+        string? embeddedHash = null;
+
+        foreach (var markerGroup in markerFiles
+            .GroupBy(file => file.Number)
+            .OrderBy(group => group.Key))
+        {
+            var markers = markerGroup.ToArray();
+            var matchingVpks = vpkFiles
+                .Where(file => file.Number == markerGroup.Key)
+                .ToArray();
+            var canonicalName = FormatVpkFileName(markerGroup.Key);
+
+            if (markers.Length != 1)
+            {
+                problems.Add(
+                    $"Multiple ownership markers were found for " +
+                    $"{canonicalName}. Threat HUD Bridge will not " +
+                    "modify any of them."
+                );
+                continue;
+            }
+
+            if (matchingVpks.Length == 0)
+            {
+                problems.Add(
+                    $"The ownership marker for {canonicalName} exists, " +
+                    "but the VPK is missing. Remove the stale marker " +
+                    "before continuing."
+                );
+                continue;
+            }
+
+            if (matchingVpks.Length != 1)
+            {
+                problems.Add(
+                    $"Multiple files match {canonicalName}. Threat HUD " +
+                    "Bridge cannot safely determine which one is managed."
+                );
+                continue;
+            }
+
+            string recordedHash;
+            try
+            {
+                recordedHash = ReadRecordedHashStrict(markers[0].Path);
+            }
+            catch (InvalidDataException error)
+            {
+                problems.Add(error.Message);
+                continue;
+            }
+
+            var installedHash = CalculateFileHash(
+                matchingVpks[0].Path,
+                cancellationToken
+            );
+            if (!String.Equals(
+                installedHash,
+                recordedHash,
+                StringComparison.OrdinalIgnoreCase
+            ))
+            {
+                problems.Add(
+                    $"The ownership marker for {canonicalName} does not " +
+                    "match the VPK. Threat HUD Bridge will not overwrite " +
+                    "or delete it."
+                );
+                continue;
+            }
+
+            embeddedHash ??= GetEmbeddedVpkHash();
+            managedCandidates.Add(
+                new ManagedVpkCandidate(
+                    markerGroup.Key,
+                    matchingVpks[0].Path,
+                    markers[0].Path,
+                    installedHash,
+                    String.Equals(
+                        installedHash,
+                        embeddedHash,
+                        StringComparison.OrdinalIgnoreCase
+                    ),
+                    true
+                )
+            );
+        }
+
+        // Bridge versions before ownership sidecars treated pak57_dir.vpk
+        // as managed only when it was byte-for-byte identical to the
+        // embedded payload. Preserve that narrow rule so an old install is
+        // not duplicated, while every other markerless VPK remains foreign.
+        if (!markerFiles.Any(file => file.Number == LegacyVpkNumber))
+        {
+            var legacyVpks = vpkFiles
+                .Where(file => file.Number == LegacyVpkNumber)
+                .ToArray();
+
+            if (legacyVpks.Length == 1)
+            {
+                var legacyHash = CalculateFileHash(
+                    legacyVpks[0].Path,
+                    cancellationToken
+                );
+                embeddedHash ??= GetEmbeddedVpkHash();
+
+                if (String.Equals(
+                    legacyHash,
+                    embeddedHash,
+                    StringComparison.OrdinalIgnoreCase
+                ))
+                {
+                    managedCandidates.Add(
+                        new ManagedVpkCandidate(
+                            LegacyVpkNumber,
+                            legacyVpks[0].Path,
+                            legacyVpks[0].Path + OwnershipMarkerSuffix,
+                            legacyHash,
+                            true,
+                            false
+                        )
+                    );
+                }
+            }
+        }
+
+        if (managedCandidates.Count > 1)
+        {
+            problems.Add(
+                "Multiple Threat HUD VPK installations were found (" +
+                String.Join(
+                    ", ",
+                    managedCandidates
+                        .OrderBy(candidate => candidate.Number)
+                        .Select(candidate =>
+                            FormatVpkFileName(candidate.Number))
+                ) +
+                "). Keep only one managed installation before continuing."
+            );
+        }
+
+        var hasOwnershipConflict = problems.Count > 0;
+
+        var nextInstallNumber = SelectNextVpkNumber(
+            vpkFiles.Select(file => Path.GetFileName(file.Path)!)
         );
-        var isOwned = isCurrentPayload || String.Equals(
-            installedHash,
-            recordedHash,
+
+        if (
+            managedCandidates.Count == 0 &&
+            nextInstallNumber is null
+        )
+        {
+            problems.Add(CreateNoAvailableVpkSlotMessage());
+        }
+
+        var distinctProblems = problems
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        return new VpkInventory(
+            vpkFiles,
+            managedCandidates,
+            nextInstallNumber,
+            hasOwnershipConflict,
+            distinctProblems.Length == 0
+                ? null
+                : String.Join(Environment.NewLine, distinctProblems)
+        );
+    }
+
+    internal static bool TryParseVpkFileName(
+        string fileName,
+        out int number
+    )
+    {
+        var match = InstalledVpkFilePattern.Match(fileName);
+        return TryParseVpkNumber(match, out number);
+    }
+
+    internal static int? SelectNextVpkNumber(
+        IEnumerable<string> fileNames
+    )
+    {
+        ArgumentNullException.ThrowIfNull(fileNames);
+        var occupiedNumbers = new HashSet<int>();
+
+        foreach (var fileName in fileNames)
+        {
+            if (TryParseVpkFileName(fileName, out var number))
+            {
+                occupiedNumbers.Add(number);
+            }
+        }
+
+        if (occupiedNumbers.Count == 0)
+        {
+            return FirstVpkNumber;
+        }
+
+        var maximum = occupiedNumbers.Max();
+        if (maximum < LastVpkNumber)
+        {
+            return maximum + 1;
+        }
+
+        // pak99 is already occupied, so use the highest remaining slot.
+        // This preserves the highest possible load order and blocks only
+        // when every supported number is genuinely occupied.
+        for (
+            var candidate = LastVpkNumber - 1;
+            candidate >= FirstVpkNumber;
+            candidate--
+        )
+        {
+            if (!occupiedNumbers.Contains(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryParseOwnershipMarkerFileName(
+        string fileName,
+        out int number
+    )
+    {
+        var match = OwnershipMarkerFilePattern.Match(fileName);
+        return TryParseVpkNumber(match, out number);
+    }
+
+    private static bool TryParseVpkNumber(Match match, out int number)
+    {
+        number = 0;
+        return match.Success &&
+            Int32.TryParse(
+                match.Groups["number"].Value,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out number
+            ) &&
+            number is >= FirstVpkNumber and <= LastVpkNumber;
+    }
+
+    private static string FormatVpkFileName(int number) =>
+        "pak" +
+        number.ToString("00", CultureInfo.InvariantCulture) +
+        "_dir.vpk";
+
+    private static string CreateNoAvailableVpkSlotMessage() =>
+        "Cannot install the Threat HUD VPK because all supported VPK " +
+        "slots (pak01_dir.vpk through pak99_dir.vpk) are occupied. " +
+        "Remove an unused VPK from the Deadlock addons folder and try again.";
+
+    private static string CombineBlockReasons(
+        string? first,
+        string second
+    ) =>
+        String.IsNullOrWhiteSpace(first)
+            ? second
+            : String.Equals(first, second, StringComparison.Ordinal)
+                ? first
+                : first + Environment.NewLine + second;
+
+    private static void ThrowIfVpkBlocked(VpkInventory inventory)
+    {
+        if (!String.IsNullOrWhiteSpace(inventory.BlockReason))
+        {
+            throw new InvalidOperationException(inventory.BlockReason);
+        }
+    }
+
+    private static bool IsSameManagedVpk(
+        ManagedVpkCandidate left,
+        ManagedVpkCandidate right
+    ) =>
+        IsSameManagedVpkPayload(left, right) &&
+        left.HasOwnershipMarker == right.HasOwnershipMarker;
+
+    private static bool IsSameManagedVpkPayload(
+        ManagedVpkCandidate left,
+        ManagedVpkCandidate right
+    ) =>
+        left.Number == right.Number &&
+        String.Equals(
+            left.VpkPath,
+            right.VpkPath,
+            StringComparison.OrdinalIgnoreCase
+        ) &&
+        String.Equals(
+            left.MarkerPath,
+            right.MarkerPath,
+            StringComparison.OrdinalIgnoreCase
+        ) &&
+        String.Equals(
+            left.InstalledHash,
+            right.InstalledHash,
             StringComparison.OrdinalIgnoreCase
         );
 
-        return new InstalledVpkOwnership(
-            true,
-            isOwned,
-            isCurrentPayload
+    private void AdoptLegacyOwnershipMarkerCore(
+        DeadlockPaths paths,
+        ManagedVpkCandidate expectedMod,
+        CancellationToken cancellationToken
+    )
+    {
+        if (expectedMod.HasOwnershipMarker)
+        {
+            return;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureDeadlockIsStopped();
+
+        // Re-scan immediately before writing. A marker that appeared and is
+        // valid is accepted; every invalid or unrelated change is blocked.
+        var inventory = InspectVpkInventory(paths, cancellationToken);
+        ThrowIfVpkBlocked(inventory);
+        if (inventory.ManagedCandidates.Count != 1)
+        {
+            throw new InvalidOperationException(
+                "The legacy Threat HUD VPK changed while its ownership " +
+                "marker was being prepared. No files were changed."
+            );
+        }
+
+        var currentMod = inventory.ManagedCandidates[0];
+        if (!IsSameManagedVpkPayload(expectedMod, currentMod))
+        {
+            throw new InvalidOperationException(
+                "The legacy Threat HUD VPK changed while its ownership " +
+                "marker was being prepared. No files were changed."
+            );
+        }
+
+        if (currentMod.HasOwnershipMarker)
+        {
+            return;
+        }
+
+        var embeddedHash = GetEmbeddedVpkHash();
+
+        // ThreatHudBridge is Windows-only. Holding the VPK without sharing
+        // closes the hash-to-marker race while the CreateNew sidecar is
+        // committed, without renaming or overwriting the legacy payload.
+        using var lockedVpk = new FileStream(
+            currentMod.VpkPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.None,
+            128 * 1024,
+            FileOptions.SequentialScan
+        );
+        var lockedHash = CalculateStreamHash(
+            lockedVpk,
+            cancellationToken
+        );
+        if (
+            !String.Equals(
+                lockedHash,
+                currentMod.InstalledHash,
+                StringComparison.OrdinalIgnoreCase
+            ) ||
+            !String.Equals(
+                lockedHash,
+                embeddedHash,
+                StringComparison.OrdinalIgnoreCase
+            )
+        )
+        {
+            throw new InvalidOperationException(
+                "The legacy pak57_dir.vpk changed while its ownership " +
+                "marker was being prepared. No files were changed."
+            );
+        }
+
+        // Do not observe cancellation after this point: the marker write is
+        // the commit. File.Move(overwrite: false) prevents adopting over a
+        // marker created by another process.
+        WriteNewTextAtomically(
+            currentMod.MarkerPath,
+            embeddedHash + Environment.NewLine
         );
     }
 
@@ -702,26 +1670,26 @@ internal sealed class ThreatHudModManagerService
         }
     }
 
-    private static string? TryReadRecordedHash(string hashPath)
+    private static string ReadRecordedHashStrict(string hashPath)
     {
         if (!File.Exists(hashPath))
         {
-            return null;
+            throw new FileNotFoundException(
+                "The Threat HUD ownership marker is missing.",
+                hashPath
+            );
         }
 
-        try
+        var value = File.ReadAllText(hashPath, Encoding.ASCII).Trim();
+        if (value.Length != 64 || !value.All(Uri.IsHexDigit))
         {
-            var value = File.ReadAllText(hashPath, Encoding.ASCII).Trim();
-            return value.Length == 64 && value.All(Uri.IsHexDigit)
-                ? value
-                : null;
+            throw new InvalidDataException(
+                "The ownership marker " + Path.GetFileName(hashPath) +
+                " is invalid. It must contain exactly one SHA-256 hash."
+            );
         }
-        catch (Exception error) when (
-            error is IOException or UnauthorizedAccessException
-        )
-        {
-            return null;
-        }
+
+        return value;
     }
 
     private static string CalculateFileHash(
@@ -737,6 +1705,14 @@ internal sealed class ThreatHudModManagerService
             128 * 1024,
             FileOptions.SequentialScan
         );
+        return CalculateStreamHash(stream, cancellationToken);
+    }
+
+    private static string CalculateStreamHash(
+        Stream stream,
+        CancellationToken cancellationToken
+    )
+    {
         using var hasher = IncrementalHash.CreateHash(
             HashAlgorithmName.SHA256
         );
@@ -776,9 +1752,7 @@ internal sealed class ThreatHudModManagerService
 
         return new DeadlockPaths(
             Path.Combine(citadelDirectory, "gameinfo.gi"),
-            addonsDirectory,
-            Path.Combine(addonsDirectory, InstalledVpkFileName),
-            Path.Combine(addonsDirectory, InstalledHashFileName)
+            addonsDirectory
         );
     }
 
@@ -1734,7 +2708,7 @@ internal sealed class ThreatHudModManagerService
         }
     }
 
-    private static void WriteTextAtomically(string path, string value)
+    private static void WriteNewTextAtomically(string path, string value)
     {
         var temporaryPath = path + $".{Guid.NewGuid():N}.tmp";
         try
@@ -1743,7 +2717,7 @@ internal sealed class ThreatHudModManagerService
                 temporaryPath,
                 new UTF8Encoding(false).GetBytes(value)
             );
-            File.Move(temporaryPath, path, overwrite: true);
+            File.Move(temporaryPath, path, overwrite: false);
         }
         finally
         {
@@ -1857,15 +2831,34 @@ internal sealed class ThreatHudModManagerService
 
     private sealed record DeadlockPaths(
         string GameInfoPath,
-        string AddonsDirectory,
-        string InstalledVpkPath,
-        string InstalledHashPath
+        string AddonsDirectory
     );
 
-    private sealed record InstalledVpkOwnership(
-        bool Exists,
-        bool IsOwned,
-        bool IsCurrentPayload
+    private sealed record NamedVpkFile(
+        int Number,
+        string Path
+    );
+
+    private sealed record NamedMarkerFile(
+        int Number,
+        string Path
+    );
+
+    private sealed record ManagedVpkCandidate(
+        int Number,
+        string VpkPath,
+        string MarkerPath,
+        string InstalledHash,
+        bool IsCurrentPayload,
+        bool HasOwnershipMarker
+    );
+
+    private sealed record VpkInventory(
+        IReadOnlyList<NamedVpkFile> VpkFiles,
+        IReadOnlyList<ManagedVpkCandidate> ManagedCandidates,
+        int? NextInstallNumber,
+        bool HasOwnershipConflict,
+        string? BlockReason
     );
 
     private sealed record SearchPathsBlock(

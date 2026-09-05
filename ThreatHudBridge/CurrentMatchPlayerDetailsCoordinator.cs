@@ -7,6 +7,9 @@ internal sealed class CurrentMatchPlayerDetailsCoordinator :
     private readonly DeadlockPlayerStatsService
         _playerStatsService;
 
+    private readonly DeadlockPlayerRankService
+        _playerRankService;
+
     private readonly CancellationToken
         _lifetimeToken;
 
@@ -38,6 +41,7 @@ internal sealed class CurrentMatchPlayerDetailsCoordinator :
     public CurrentMatchPlayerDetailsCoordinator(
         DeadlockHeroCatalogService heroCatalogService,
         DeadlockPlayerStatsService playerStatsService,
+        DeadlockPlayerRankService playerRankService,
         CancellationToken lifetimeToken,
         Action<string>? log = null,
         Action<
@@ -55,6 +59,12 @@ internal sealed class CurrentMatchPlayerDetailsCoordinator :
             playerStatsService ??
             throw new ArgumentNullException(
                 nameof(playerStatsService)
+            );
+
+        _playerRankService =
+            playerRankService ??
+            throw new ArgumentNullException(
+                nameof(playerRankService)
             );
 
         _lifetimeToken =
@@ -199,7 +209,8 @@ internal sealed class CurrentMatchPlayerDetailsCoordinator :
     public bool StartForRequests(
         IReadOnlyList<
             CurrentMatchPlayerHeroRequest
-        > requests
+        > requests,
+        bool includeRank
     )
     {
         lock (_stateGate)
@@ -211,14 +222,16 @@ internal sealed class CurrentMatchPlayerDetailsCoordinator :
 
             return _currentService
                 .StartForRequests(
-                    requests
+                    requests,
+                    includeRank
                 );
         }
     }
 
     public bool StartForRoster(
         DeadlockLaneAdvisorRosterRequest roster,
-        uint ownAccountId
+        uint ownAccountId,
+        bool includeRank
     )
     {
         lock (_stateGate)
@@ -231,7 +244,8 @@ internal sealed class CurrentMatchPlayerDetailsCoordinator :
             return _currentService
                 .StartForRoster(
                     roster,
-                    ownAccountId
+                    ownAccountId,
+                    includeRank
                 );
         }
     }
@@ -260,12 +274,59 @@ internal sealed class CurrentMatchPlayerDetailsCoordinator :
         }
     }
 
+    public bool ApplyRankSnapshot(
+        CurrentMatchPlayerRanksSnapshot snapshot,
+        bool includeRank
+    )
+    {
+        ArgumentNullException.ThrowIfNull(
+            snapshot
+        );
+
+        lock (_stateGate)
+        {
+            if (_disposed)
+            {
+                return false;
+            }
+
+            return _currentService
+                .ApplyRankSnapshot(
+                    snapshot,
+                    includeRank
+                );
+        }
+    }
+
+    public bool RefreshRanksForMatch(
+        ulong expectedMatchId
+    )
+    {
+        lock (_stateGate)
+        {
+            if (
+                _disposed ||
+                expectedMatchId == 0 ||
+                _serviceIsUnassigned ||
+                _matchId !=
+                    expectedMatchId
+            )
+            {
+                return false;
+            }
+
+            return _currentService
+                .StartRankRefresh();
+        }
+    }
+
     private DeadlockMatchPlayerDetailsService
         CreateService()
     {
         return new DeadlockMatchPlayerDetailsService(
             _heroCatalogService,
             _playerStatsService,
+            _playerRankService,
             _lifetimeToken,
             OnServiceReady
         );

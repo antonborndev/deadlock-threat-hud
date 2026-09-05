@@ -27,6 +27,9 @@ internal sealed class ThreatHudBridgeRuntime :
     private const string HttpAddress =
         "http://127.0.0.1:28741";
 
+    private const string CurrentMatchResultChannel =
+        "current-match-result";
+
     private static readonly byte[]
         TransparentPixelPng =
             Convert.FromBase64String(
@@ -417,10 +420,27 @@ internal sealed class ThreatHudBridgeRuntime :
                 cancellationToken
             );
 
+        using var playerRankService =
+            new DeadlockPlayerRankService(
+                deadlockApiHttpClient,
+
+                cacheLifetime:
+                    TimeSpan.FromMinutes(10),
+
+                maximumConcurrency:
+                    4
+            );
+
+        var currentMatchPlayerRanksService =
+            new CurrentMatchPlayerRanksService(
+                playerRankService
+            );
+
         await using var matchPlayerDetailsService =
             new CurrentMatchPlayerDetailsCoordinator(
                 heroCatalogService,
                 playerStatsService,
+                playerRankService,
                 cancellationToken,
                 Log,
                 ready =>
@@ -430,6 +450,33 @@ internal sealed class ThreatHudBridgeRuntime :
                             ready.GeneratedAtUtc
                         )
             );
+
+        /*
+         * Match state, player details and lane results must be sampled under
+         * the same gate that protects Panorama-driven match transitions.
+         */
+        var currentMatchLifecycleGate =
+            new object();
+
+        var matchHistoryStore =
+            new MatchHistoryStore();
+
+        var matchHistoryCaptureService =
+            new MatchHistoryCaptureService(
+                currentMatchLifecycleGate,
+                currentMatchContextService,
+                matchPlayerDetailsService,
+                serviceStatusStore,
+                laneAdvisorService,
+                ownAccountId,
+                matchHistoryStore,
+                Log
+            );
+
+        Log(
+            "Match history DB: " +
+            matchHistoryStore.DatabasePath
+        );
 
         var reactionStore =
             new PlayerHeroReactionStore();
@@ -457,22 +504,6 @@ internal sealed class ThreatHudBridgeRuntime :
                 Log
             );
 
-        using var playerRankService =
-            new DeadlockPlayerRankService(
-                deadlockApiHttpClient,
-
-                cacheLifetime:
-                    TimeSpan.FromMinutes(10),
-
-                maximumConcurrency:
-                    4
-            );
-
-        var currentMatchPlayerRanksService =
-            new CurrentMatchPlayerRanksService(
-                playerRankService
-            );
-
         using var rankImageService =
             new DeadlockRankImageService(
                 deadlockApiHttpClient,
@@ -489,6 +520,9 @@ internal sealed class ThreatHudBridgeRuntime :
                 null;
 
         Task? callbackTask =
+            null;
+
+        Task? matchHistoryTask =
             null;
 
         var appStarted =
@@ -512,7 +546,9 @@ internal sealed class ThreatHudBridgeRuntime :
                     laneAdvisorService,
                     matchPlayerDetailsService,
                     ownSteamId64,
-                    ownAccountId
+                    ownAccountId,
+                    currentMatchLifecycleGate,
+                    matchHistoryCaptureService
                 );
 
             callbackCancellation =
@@ -527,6 +563,15 @@ internal sealed class ThreatHudBridgeRuntime :
                         RunSteamCallbacksAsync(
                             callbackCancellation.Token
                         )
+                );
+
+            matchHistoryTask =
+                Task.Run(
+                    () =>
+                        matchHistoryCaptureService
+                            .RunAsync(
+                                callbackCancellation.Token
+                            )
                 );
 
             _view.SetRuntimeState(
@@ -656,6 +701,50 @@ internal sealed class ThreatHudBridgeRuntime :
                 }
             }
 
+            if (matchHistoryTask is not null)
+            {
+                try
+                {
+                    await matchHistoryTask;
+                }
+                catch (
+                    OperationCanceledException
+                )
+                {
+                }
+                catch (Exception error)
+                {
+                    LogException(
+                        "Match history task error",
+                        error
+                    );
+                }
+            }
+
+            try
+            {
+                /*
+                 * Stop the periodic writer before the final flush so the
+                 * independent shutdown token never races for _captureGate.
+                 */
+                using var historyFlushTimeout =
+                    new CancellationTokenSource(
+                        TimeSpan.FromSeconds(5)
+                    );
+
+                await matchHistoryCaptureService
+                    .CaptureNowAsync(
+                        historyFlushTimeout.Token
+                    );
+            }
+            catch (Exception error)
+            {
+                LogException(
+                    "Match history final snapshot error",
+                    error
+                );
+            }
+
             callbackCancellation?.Dispose();
         }
     }
@@ -680,7 +769,9 @@ internal sealed class ThreatHudBridgeRuntime :
         DeadlockLaneAdvisorService laneAdvisorService,
         CurrentMatchPlayerDetailsCoordinator matchPlayerDetailsService,
         string ownSteamId64,
-        uint ownAccountId
+        uint ownAccountId,
+        object currentMatchLifecycleGate,
+        MatchHistoryCaptureService matchHistoryCaptureService
     )
     {
         var builder =
@@ -697,15 +788,6 @@ internal sealed class ThreatHudBridgeRuntime :
         var app =
             builder.Build();
 
-        /*
-         * The match context and the player-details epoch form one logical
-         * transition. Kestrel may execute two Panorama beacon requests in
-         * parallel, so both services must be moved and observed under the
-         * same gate.
-         */
-        var currentMatchLifecycleGate =
-            new object();
-
         app.Use(
             async (
                 context,
@@ -718,7 +800,7 @@ internal sealed class ThreatHudBridgeRuntime :
 
                 context.Response.Headers[
                     "Access-Control-Allow-Methods"
-                ] = "GET, OPTIONS";
+                ] = "GET, POST, OPTIONS";
 
                 context.Response.Headers[
                     "Access-Control-Allow-Headers"
@@ -766,6 +848,12 @@ internal sealed class ThreatHudBridgeRuntime :
 
                 lock (currentMatchLifecycleGate)
                 {
+                    if (!IsHeroDamageModuleEnabled())
+                    {
+                        currentMatchContextService
+                            .DisableHeroDamageForCurrentMatch();
+                    }
+
                     var matchSnapshot =
                         currentMatchContextService
                             .GetSnapshot();
@@ -773,7 +861,11 @@ internal sealed class ThreatHudBridgeRuntime :
                     hasCurrentMatch =
                         matchSnapshot.HasMatch;
 
-                    if (hasCurrentMatch)
+                    if (
+                        hasCurrentMatch &&
+                        matchSnapshot
+                            .HeroDamageAllowedForMatch
+                    )
                     {
                         serviceStatusStore.SetState(
                             BridgeServiceKind
@@ -782,6 +874,13 @@ internal sealed class ThreatHudBridgeRuntime :
                             GetHeroDamageServiceState(
                                 matchSnapshot
                             )
+                        );
+                    }
+                    else if (hasCurrentMatch)
+                    {
+                        serviceStatusStore.Reset(
+                            BridgeServiceKind
+                                .HeroDamage
                         );
                     }
 
@@ -877,12 +976,35 @@ internal sealed class ThreatHudBridgeRuntime :
                 var clearGeneratedPngCache =
                     false;
 
+                var matchChanged =
+                    false;
+
                 lock (currentMatchLifecycleGate)
                 {
-                    var matchChanged =
+                    var previousMatchId =
+                        currentMatchContextService
+                            .GetSnapshot()
+                            .MatchId;
+
+                    if (
+                        previousMatchId != 0 &&
+                        previousMatchId != matchId
+                    )
+                    {
+                        /*
+                         * Freeze the completed match before any transition
+                         * clears its players, lane result or live damage.
+                         * SQLite I/O is performed later, outside this gate.
+                         */
+                        matchHistoryCaptureService
+                            .QueueCurrentSnapshotWhileLocked();
+                    }
+
+                    matchChanged =
                         currentMatchContextService
                             .Update(
-                                matchId
+                                matchId,
+                                IsHeroDamageModuleEnabled()
                             );
 
                     if (matchChanged)
@@ -900,6 +1022,9 @@ internal sealed class ThreatHudBridgeRuntime :
                              * for the next match. No second match watcher is
                              * involved.
                              */
+                            laneAdvisorService
+                                .ResetForMatchTransition();
+
                             serviceStatusStore.ResetAll();
 
                             clearGeneratedPngCache =
@@ -910,14 +1035,52 @@ internal sealed class ThreatHudBridgeRuntime :
                             /*
                              * The non-zero beacon may arrive after one-shot
                              * Winrate/Rank requests. Preserve their results and
-                             * reset only the match-bound damage stream.
+                             * reset the match-bound damage stream. Adviser is
+                             * also reset below only for a direct transition
+                             * from one non-zero match id to another.
                              */
                             serviceStatusStore.Reset(
                                 BridgeServiceKind
                                     .HeroDamage
                             );
+
+                            if (
+                                previousMatchId != 0 &&
+                                previousMatchId !=
+                                    matchId
+                            )
+                            {
+                                /*
+                                 * A direct non-zero match transition must
+                                 * not expose the completed Adviser snapshot
+                                 * from the previous roster. The usual
+                                 * zero-to-non-zero beacon still preserves a
+                                 * one-shot Adviser result that may have
+                                 * arrived before the match id.
+                                 */
+                                laneAdvisorService
+                                    .ResetForMatchTransition();
+
+                                serviceStatusStore.Reset(
+                                    BridgeServiceKind
+                                        .Adviser
+                                );
+                            }
                         }
                     }
+                }
+
+                if (
+                    matchChanged &&
+                    matchId != 0
+                )
+                {
+                    /*
+                     * Create the list entry immediately. The periodic capture
+                     * will replace this initial snapshot as details arrive.
+                     */
+                    matchHistoryCaptureService
+                        .RequestCapture();
                 }
 
                 if (clearGeneratedPngCache)
@@ -938,6 +1101,148 @@ internal sealed class ThreatHudBridgeRuntime :
             }
         );
 
+        app.MapPost(
+            "/hero-damage-module-state-changed",
+
+            (
+                HttpContext context
+            ) =>
+            {
+                var rawEnabled =
+                    context.Request.Query[
+                        "enabled"
+                    ].ToString();
+
+                bool heroDamageEnabled;
+
+                if (rawEnabled == "1")
+                {
+                    heroDamageEnabled =
+                        true;
+                }
+                else if (rawEnabled == "0")
+                {
+                    heroDamageEnabled =
+                        false;
+                }
+                else
+                {
+                    return Results.BadRequest(
+                        new
+                        {
+                            ok = false,
+
+                            error =
+                                "enabled parameter must be 0 or 1."
+                        }
+                    );
+                }
+
+                var rawChangedAtUtcTicks =
+                    context.Request.Query[
+                        "changedAtUtcTicks"
+                    ].ToString();
+
+                if (
+                    !long.TryParse(
+                        rawChangedAtUtcTicks,
+                        out var changedAtUtcTicks
+                    ) ||
+                    changedAtUtcTicks <
+                        DateTime.MinValue.Ticks ||
+                    changedAtUtcTicks >
+                        DateTime.MaxValue.Ticks
+                )
+                {
+                    return Results.BadRequest(
+                        new
+                        {
+                            ok = false,
+
+                            error =
+                                "changedAtUtcTicks parameter is invalid."
+                        }
+                    );
+                }
+
+                var changedAtUtc =
+                    new DateTimeOffset(
+                        new DateTime(
+                            changedAtUtcTicks,
+                            DateTimeKind.Utc
+                        )
+                    );
+
+                bool stoppedForCurrentMatch;
+                bool ignoredStaleTransition;
+                CurrentMatchContextSnapshot snapshot;
+
+                lock (currentMatchLifecycleGate)
+                {
+                    var snapshotBeforeChange =
+                        currentMatchContextService
+                            .GetSnapshot();
+
+                    var matchObservedAtUtc =
+                        snapshotBeforeChange
+                            .MatchObservedAtUtc;
+
+                    /*
+                     * Honor the immutable UI transition carried by this
+                     * request. Two rapid Off/On posts may arrive out of order;
+                     * Off must still latch the current match as blocked, while
+                     * On remains a deliberate no-op until the next match. An
+                     * Off from before the current match is ignored only when
+                     * persistence has since returned to On; this keeps a
+                     * delayed request from disabling the next match.
+                     */
+                    ignoredStaleTransition =
+                        !heroDamageEnabled &&
+                        matchObservedAtUtc.HasValue &&
+                        changedAtUtc <
+                            matchObservedAtUtc.Value &&
+                        IsHeroDamageModuleEnabled();
+
+                    stoppedForCurrentMatch =
+                        !heroDamageEnabled &&
+                        !ignoredStaleTransition &&
+                        currentMatchContextService
+                            .DisableHeroDamageForCurrentMatch();
+
+                    snapshot =
+                        currentMatchContextService
+                            .GetSnapshot();
+
+                    if (
+                        snapshot.HasMatch &&
+                        !snapshot
+                            .HeroDamageAllowedForMatch
+                    )
+                    {
+                        serviceStatusStore.Reset(
+                            BridgeServiceKind
+                                .HeroDamage
+                        );
+                    }
+                }
+
+                return Results.Json(
+                    new
+                    {
+                        ok = true,
+                        heroDamageEnabled,
+                        stoppedForCurrentMatch,
+                        ignoredStaleTransition,
+                        matchId = snapshot.MatchId,
+
+                        allowedForCurrentMatch =
+                            snapshot
+                                .HeroDamageAllowedForMatch
+                    }
+                );
+            }
+        );
+
         app.MapGet(
             "/current-match-context-diagnostics",
 
@@ -945,14 +1250,32 @@ internal sealed class ThreatHudBridgeRuntime :
             {
                 lock (currentMatchLifecycleGate)
                 {
+                    var snapshot =
+                        currentMatchContextService
+                            .GetSnapshot();
+
+                    var serviceStatuses =
+                        serviceStatusStore
+                            .GetSnapshot();
+
+                    var currentLaneStats =
+                        snapshot.MatchId != 0 &&
+                        serviceStatuses.Adviser ==
+                            BridgeServiceState.Completed
+                            ? laneAdvisorService
+                                .GetCurrentLaneStatsSnapshot()
+                            : null;
+
                     return Results.Json(
                         new
                         {
                             ok = true,
 
                             snapshot =
-                                currentMatchContextService
-                                    .GetSnapshot()
+                                snapshot,
+
+                            currentLaneStats =
+                                currentLaneStats
                         }
                     );
                 }
@@ -1037,6 +1360,12 @@ internal sealed class ThreatHudBridgeRuntime :
                 BridgeServiceStatusReportRequest
                     serviceStatusReportRequest =
                         default;
+
+                var currentMatchResultWon =
+                    false;
+
+                var currentMatchResultObservedAtUnixMs =
+                    0L;
 
                 if (
                     channel ==
@@ -1247,6 +1576,75 @@ internal sealed class ThreatHudBridgeRuntime :
                         );
                     }
                 }
+                else if (
+                    channel ==
+                    CurrentMatchResultChannel
+                )
+                {
+                    var rawWon =
+                        context.Request.Query[
+                            "won"
+                        ].ToString();
+
+                    if (
+                        String.Equals(
+                            rawWon,
+                            "1",
+                            StringComparison.Ordinal
+                        )
+                    )
+                    {
+                        currentMatchResultWon =
+                            true;
+                    }
+                    else if (
+                        !String.Equals(
+                            rawWon,
+                            "0",
+                            StringComparison.Ordinal
+                        )
+                    )
+                    {
+                        return Results.BadRequest(
+                            new
+                            {
+                                ok = false,
+
+                                error =
+                                    "current-match-result requires " +
+                                    "won=1 or won=0."
+                            }
+                        );
+                    }
+
+                    var rawObservedAtUnixMs =
+                        context.Request.Query[
+                            "observedAtUnixMs"
+                        ].ToString();
+
+                    if (
+                        !long.TryParse(
+                            rawObservedAtUnixMs,
+                            System.Globalization
+                                .NumberStyles.None,
+                            System.Globalization
+                                .CultureInfo.InvariantCulture,
+                            out currentMatchResultObservedAtUnixMs
+                        )
+                    )
+                    {
+                        return Results.BadRequest(
+                            new
+                            {
+                                ok = false,
+
+                                error =
+                                    "current-match-result requires a " +
+                                    "long observedAtUnixMs value."
+                            }
+                        );
+                    }
+                }
 
                 return transport.CreateChunkResult(
                     channel,
@@ -1292,6 +1690,12 @@ internal sealed class ThreatHudBridgeRuntime :
                             {
                                 try
                                 {
+                                    if (!IsHeroDamageModuleEnabled())
+                                    {
+                                        currentMatchContextService
+                                            .DisableHeroDamageForCurrentMatch();
+                                    }
+
                                     var matchSnapshot =
                                         currentMatchContextService
                                             .GetSnapshot();
@@ -1303,14 +1707,27 @@ internal sealed class ThreatHudBridgeRuntime :
                                                 matchSnapshot.LiveDamage
                                             );
 
-                                    serviceStatusStore.SetState(
-                                        BridgeServiceKind
-                                            .HeroDamage,
+                                    if (
+                                        matchSnapshot
+                                            .HeroDamageAllowedForMatch
+                                    )
+                                    {
+                                        serviceStatusStore.SetState(
+                                            BridgeServiceKind
+                                                .HeroDamage,
 
-                                        GetHeroDamageServiceState(
-                                            matchSnapshot
-                                        )
-                                    );
+                                            GetHeroDamageServiceState(
+                                                matchSnapshot
+                                            )
+                                        );
+                                    }
+                                    else
+                                    {
+                                        serviceStatusStore.Reset(
+                                            BridgeServiceKind
+                                                .HeroDamage
+                                        );
+                                    }
 
                                     return packet;
                                 }
@@ -1383,12 +1800,21 @@ internal sealed class ThreatHudBridgeRuntime :
                                         );
                                     }
 
+                                    var includeRank =
+                                        BridgeModuleSettingsPersistence
+                                            .Load()
+                                            .IsEnabled(
+                                                BridgeServiceKind
+                                                    .Rank
+                                            );
+
                                     lock (currentMatchLifecycleGate)
                                     {
                                         matchPlayerDetailsService
                                             .StartForRoster(
                                                 laneAdvisorRequest!,
-                                                ownAccountId
+                                                ownAccountId,
+                                                includeRank
                                             );
 
                                         laneAdvisorService
@@ -1430,11 +1856,20 @@ internal sealed class ThreatHudBridgeRuntime :
 
                                 () =>
                                 {
+                                    var includeRank =
+                                        BridgeModuleSettingsPersistence
+                                            .Load()
+                                            .IsEnabled(
+                                                BridgeServiceKind
+                                                    .Rank
+                                            );
+
                                     lock (currentMatchLifecycleGate)
                                     {
                                         matchPlayerDetailsService
                                             .StartForRequests(
-                                                statsRequests
+                                                statsRequests,
+                                                includeRank
                                             );
                                     }
 
@@ -1477,6 +1912,10 @@ internal sealed class ThreatHudBridgeRuntime :
                                 .Channel
                         )
                         {
+                            CurrentMatchPlayerRanksSnapshot?
+                                completedRankSnapshot =
+                                    null;
+
                             return ExecuteServiceRequest(
                                 serviceStatusStore,
                                 BridgeServiceKind.Rank,
@@ -1495,6 +1934,9 @@ internal sealed class ThreatHudBridgeRuntime :
                                             .GetAwaiter()
                                             .GetResult();
 
+                                    completedRankSnapshot =
+                                        result.Snapshot;
+
                                     return (
                                         result.Packet,
 
@@ -1504,8 +1946,169 @@ internal sealed class ThreatHudBridgeRuntime :
                                             : BridgeServiceState
                                                 .Completed
                                     );
+                                },
+
+                                () =>
+                                {
+                                    if (
+                                        completedRankSnapshot is
+                                            not null
+                                    )
+                                    {
+                                        matchPlayerDetailsService
+                                            .ApplyRankSnapshot(
+                                                completedRankSnapshot,
+                                                BridgeModuleSettingsPersistence
+                                                    .Load()
+                                                    .IsEnabled(
+                                                        BridgeServiceKind
+                                                            .Rank
+                                                    )
+                                            );
+                                    }
                                 }
                             );
+                        }
+
+                        if (
+                            channel ==
+                            CurrentMatchResultChannel
+                        )
+                        {
+                            lock (currentMatchLifecycleGate)
+                            {
+                                var snapshot =
+                                    currentMatchContextService
+                                        .GetSnapshot();
+
+                                var matchObservedAtUtc =
+                                    snapshot.MatchObservedAtUtc;
+
+                                if (
+                                    !MatchHistoryStore
+                                        .IsPlausibleMatchId(
+                                            snapshot.MatchId
+                                        ) ||
+                                    !matchObservedAtUtc.HasValue
+                                )
+                                {
+                                    Log(
+                                        "Current match result ignored: " +
+                                        "no plausible current match."
+                                    );
+                                }
+                                else
+                                {
+                                    DateTimeOffset
+                                        observedAtUtc;
+
+                                    var timestampValid =
+                                        true;
+
+                                    try
+                                    {
+                                        observedAtUtc =
+                                            DateTimeOffset
+                                                .FromUnixTimeMilliseconds(
+                                                    currentMatchResultObservedAtUnixMs
+                                                );
+                                    }
+                                    catch (
+                                        ArgumentOutOfRangeException
+                                    )
+                                    {
+                                        observedAtUtc =
+                                            default;
+
+                                        timestampValid =
+                                            false;
+                                    }
+
+                                    var nowUtc =
+                                        DateTimeOffset.UtcNow;
+
+                                    if (
+                                        timestampValid &&
+                                        (
+                                            observedAtUtc >
+                                                nowUtc.AddSeconds(5) ||
+                                            observedAtUtc <
+                                                nowUtc.AddMinutes(-1) ||
+                                            observedAtUtc <
+                                                matchObservedAtUtc
+                                                    .Value
+                                        )
+                                    )
+                                    {
+                                        timestampValid =
+                                            false;
+                                    }
+
+                                    if (!timestampValid)
+                                    {
+                                        Log(
+                                            "Current match result ignored: " +
+                                            "invalid or stale observation" +
+                                            " | matchId=" +
+                                            snapshot.MatchId +
+                                            " | observedAtUnixMs=" +
+                                            currentMatchResultObservedAtUnixMs
+                                        );
+                                    }
+                                    else if (
+                                        currentMatchContextService
+                                            .TrySetLocalPlayerWon(
+                                                snapshot.MatchId,
+                                                currentMatchResultWon,
+                                                out var changed
+                                            )
+                                    )
+                                    {
+                                        if (changed)
+                                        {
+                                            matchHistoryCaptureService
+                                                .QueueCurrentSnapshotWhileLocked();
+
+                                            Log(
+                                                "Current match result accepted" +
+                                                " | matchId=" +
+                                                snapshot.MatchId +
+                                                " | won=" +
+                                                (
+                                                    currentMatchResultWon
+                                                        ? "1"
+                                                        : "0"
+                                                )
+                                            );
+                                        }
+                                    }
+                                    else
+                                    {
+                                        Log(
+                                            "Current match result ignored: " +
+                                            "conflicting first-wins result" +
+                                            " | matchId=" +
+                                            snapshot.MatchId
+                                        );
+                                    }
+                                }
+                            }
+
+                            /*
+                             * A parsed report is terminally handled even when
+                             * it cannot be bound safely. The bounded Panorama
+                             * sender retries transport failures only.
+                             */
+                            return BridgeProtocol
+                                .CreatePacket(
+                                    BridgeMessageType
+                                        .ServiceStatusAck,
+
+                                    new byte[]
+                                    {
+                                        1
+                                    }
+                                );
                         }
 
                         return payloadService.BuildPacket(
@@ -1654,6 +2257,79 @@ internal sealed class ThreatHudBridgeRuntime :
                         snapshot
                     );
                 }
+            }
+        );
+
+        app.MapPost(
+            "/match-player-ranks-refresh",
+
+            () =>
+            {
+                if (
+                    !BridgeModuleSettingsPersistence
+                        .Load()
+                        .IsEnabled(
+                            BridgeServiceKind.Rank
+                        )
+                )
+                {
+                    return Results.Json(
+                        new
+                        {
+                            ok = false,
+                            started = false,
+                            retry = false,
+                            reason = "rank-disabled"
+                        }
+                    );
+                }
+
+                bool started;
+                bool retry;
+
+                lock (currentMatchLifecycleGate)
+                {
+                    var contextSnapshot =
+                        currentMatchContextService
+                            .GetSnapshot();
+
+                    var detailsSnapshot =
+                        matchPlayerDetailsService
+                            .GetSnapshotForMatch(
+                                contextSnapshot.MatchId
+                            );
+
+                    started =
+                        matchPlayerDetailsService
+                            .RefreshRanksForMatch(
+                                contextSnapshot.MatchId
+                            );
+
+                    retry =
+                        !started &&
+                        contextSnapshot.MatchId != 0 &&
+                        (
+                            String.Equals(
+                                detailsSnapshot.Status,
+                                "waiting",
+                                StringComparison.Ordinal
+                            ) ||
+                            String.Equals(
+                                detailsSnapshot.Status,
+                                "loading",
+                                StringComparison.Ordinal
+                            )
+                        );
+                }
+
+                return Results.Json(
+                    new
+                    {
+                        ok = true,
+                        started,
+                        retry
+                    }
+                );
             }
         );
 
@@ -2188,7 +2864,8 @@ internal sealed class ThreatHudBridgeRuntime :
         Func<(
             byte[] Packet,
             BridgeServiceState State
-        )> packetFactory
+        )> packetFactory,
+        Action? acceptedHandler = null
     )
     {
         ArgumentNullException.ThrowIfNull(
@@ -2215,6 +2892,9 @@ internal sealed class ThreatHudBridgeRuntime :
             var result =
                 packetFactory();
 
+            var accepted =
+                sessionOrdinal <= 0;
+
             if (tracksStatus)
             {
                 /*
@@ -2223,10 +2903,27 @@ internal sealed class ThreatHudBridgeRuntime :
                  * and the older request is still served without touching the
                  * newer visible state.
                  */
-                statusStore.Complete(
-                    token,
-                    result.State
-                );
+                accepted =
+                    statusStore.Complete(
+                        token,
+                        result.State
+                    );
+            }
+
+            if (accepted)
+            {
+                try
+                {
+                    acceptedHandler?.Invoke();
+                }
+                catch
+                {
+                    /*
+                     * A supplementary desktop update must not turn a
+                     * successfully built Panorama response into an HTTP
+                     * failure.
+                     */
+                }
             }
 
             return result.Packet;
@@ -2299,6 +2996,16 @@ internal sealed class ThreatHudBridgeRuntime :
         }
 
         return BridgeServiceState.InProgress;
+    }
+
+    private static bool IsHeroDamageModuleEnabled()
+    {
+        return BridgeModuleSettingsPersistence
+            .Load()
+            .IsEnabled(
+                BridgeServiceKind
+                    .HeroDamage
+            );
     }
 
     private async Task RunSteamCallbacksAsync(

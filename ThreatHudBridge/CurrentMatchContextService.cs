@@ -26,6 +26,12 @@ internal sealed class CurrentMatchContextService :
 
     private long _generation;
 
+    private bool
+        _heroDamageAllowedForMatch;
+
+    private bool?
+        _localPlayerWon;
+
     private DateTimeOffset?
         _lastReceivedAtUtc;
 
@@ -62,7 +68,8 @@ internal sealed class CurrentMatchContextService :
     }
 
     public bool Update(
-        ulong matchId
+        ulong matchId,
+        bool heroDamageEnabledAtMatchStart
     )
     {
         var changed =
@@ -93,12 +100,24 @@ internal sealed class CurrentMatchContextService :
                 _matchId =
                     matchId;
 
+                _localPlayerWon =
+                    null;
+
                 _matchObservedAtUtc =
                     matchId == 0
                         ? null
                         : receivedAtUtc;
 
                 _generation++;
+
+                /*
+                 * The Hero Damage decision is latched once per match. Turning
+                 * the checkbox back on later must not start a network workflow
+                 * in the middle of that match.
+                 */
+                _heroDamageAllowedForMatch =
+                    matchId != 0 &&
+                    heroDamageEnabledAtMatchStart;
 
                 _heroStatsGeneratedAtUtc =
                     null;
@@ -159,6 +178,132 @@ internal sealed class CurrentMatchContextService :
 
         _log(
             "Current match context: matchId=" +
+            matchId +
+            " | heroDamage=" +
+            (
+                heroDamageEnabledAtMatchStart
+                    ? "allowed"
+                    : "blocked"
+            )
+        );
+
+        return true;
+    }
+
+    public bool TrySetLocalPlayerWon(
+        ulong expectedMatchId,
+        bool localPlayerWon,
+        out bool changed
+    )
+    {
+        lock (_stateGate)
+        {
+            changed =
+                false;
+
+            if (
+                _matchId == 0 ||
+                _matchId !=
+                    expectedMatchId
+            )
+            {
+                return false;
+            }
+
+            if (!_localPlayerWon.HasValue)
+            {
+                _localPlayerWon =
+                    localPlayerWon;
+
+                changed =
+                    true;
+
+                return true;
+            }
+
+            return _localPlayerWon.Value ==
+                localPlayerWon;
+        }
+    }
+
+    public bool DisableHeroDamageForCurrentMatch()
+    {
+        ulong matchId;
+
+        CancellationTokenSource?
+            scheduleCancellation;
+
+        Task?
+            scheduleTask;
+
+        lock (_stateGate)
+        {
+            if (
+                _matchId == 0 ||
+                !_heroDamageAllowedForMatch
+            )
+            {
+                return false;
+            }
+
+            matchId =
+                _matchId;
+
+            _heroDamageAllowedForMatch =
+                false;
+
+            /*
+             * Invalidating the generation prevents the delayed task from
+             * starting the URL probe even when cancellation races with the
+             * end of its five-second delay.
+             */
+            _generation++;
+
+            _broadcastProbeScheduledStartAtUtc =
+                null;
+
+            scheduleCancellation =
+                _scheduleCancellation;
+
+            scheduleTask =
+                _scheduleTask;
+
+            _scheduleCancellation =
+                null;
+
+            _scheduleTask =
+                null;
+        }
+
+        Cancel(
+            scheduleCancellation
+        );
+
+        _ =
+            DisposeScheduleAsync(
+                scheduleTask,
+                scheduleCancellation
+            );
+
+        /*
+         * ResetMatch(0) is the broadcast probe's existing hard-stop path. It
+         * cancels a pending/in-flight stream URL probe and makes a late READY
+         * callback stale. Live damage has a match-aware stop so a stale start
+         * is rejected even if it races with this method.
+         */
+        _broadcastProbeService
+            .ResetMatch(
+                0
+            );
+
+        _liveDamageService
+            .DisableForMatch(
+                matchId
+            );
+
+        _log(
+            "Current match Hero Damage: disabled for the remainder of match" +
+            " | matchId=" +
             matchId
         );
 
@@ -189,6 +334,7 @@ internal sealed class CurrentMatchContextService :
                 _matchId == 0 ||
                 _matchId !=
                     expectedMatchId ||
+                !_heroDamageAllowedForMatch ||
                 _heroStatsReadyAtUtc
                     .HasValue
             )
@@ -289,6 +435,12 @@ internal sealed class CurrentMatchContextService :
                         _matchId !=
                             0,
 
+                    LocalPlayerWon:
+                        _localPlayerWon,
+
+                    HeroDamageAllowedForMatch:
+                        _heroDamageAllowedForMatch,
+
                     LastReceivedAtUtc:
                         _lastReceivedAtUtc,
 
@@ -366,6 +518,7 @@ internal sealed class CurrentMatchContextService :
                         matchId ||
                     _generation !=
                         generation ||
+                    !_heroDamageAllowedForMatch ||
                     _broadcastProbeScheduledStartAtUtc !=
                         scheduledStartAtUtc
                 )
@@ -435,23 +588,24 @@ internal sealed class CurrentMatchContextService :
         CurrentMatchBroadcastReady ready
     )
     {
-        var isCurrentMatch =
+        var canStart =
             false;
 
         lock (_stateGate)
         {
-            isCurrentMatch =
+            canStart =
                 _matchId !=
                     0 &&
                 _matchId ==
-                    ready.MatchId;
+                    ready.MatchId &&
+                _heroDamageAllowedForMatch;
         }
 
-        if (!isCurrentMatch)
+        if (!canStart)
         {
             _log(
                 "Current match live damage: " +
-                "ignored stale broadcast READY" +
+                "ignored stale or disabled broadcast READY" +
                 " | matchId=" +
                 ready.MatchId
             );
@@ -522,6 +676,9 @@ internal sealed class CurrentMatchContextService :
 
             _matchId =
                 0;
+
+            _heroDamageAllowedForMatch =
+                false;
 
             _matchObservedAtUtc =
                 null;
@@ -596,6 +753,8 @@ internal sealed class CurrentMatchContextService :
 internal sealed record CurrentMatchContextSnapshot(
     ulong MatchId,
     bool HasMatch,
+    bool? LocalPlayerWon,
+    bool HeroDamageAllowedForMatch,
     DateTimeOffset? LastReceivedAtUtc,
     DateTimeOffset? MatchObservedAtUtc,
     DateTimeOffset? HeroStatsGeneratedAtUtc,

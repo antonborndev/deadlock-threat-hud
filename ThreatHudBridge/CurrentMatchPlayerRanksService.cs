@@ -210,7 +210,10 @@ internal sealed class CurrentMatchPlayerRanksService
                         player.Status ==
                             DeadlockPlayerRankStatus
                                 .ApiError
-                )
+                ),
+
+            Snapshot:
+                snapshot
         );
     }
 
@@ -410,7 +413,8 @@ internal sealed record
 internal sealed record
     CurrentMatchPlayerRanksPacketResult(
         byte[] Packet,
-        bool HasApiErrors
+        bool HasApiErrors,
+        CurrentMatchPlayerRanksSnapshot Snapshot
     );
 
 internal sealed record

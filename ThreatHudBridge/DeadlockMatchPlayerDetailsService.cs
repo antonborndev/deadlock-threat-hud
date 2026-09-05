@@ -10,6 +10,9 @@ internal sealed class DeadlockMatchPlayerDetailsService :
     private readonly DeadlockPlayerStatsService
         _playerStatsService;
 
+    private readonly DeadlockPlayerRankService
+        _playerRankService;
+
     private readonly CancellationToken
         _lifetimeToken;
 
@@ -38,6 +41,8 @@ internal sealed class DeadlockMatchPlayerDetailsService :
 
     private long _generation;
 
+    private long _rankRefreshGeneration;
+
     private DeadlockMatchPlayerDetailsSnapshot
         _snapshot =
             DeadlockMatchPlayerDetailsSnapshot
@@ -48,6 +53,7 @@ internal sealed class DeadlockMatchPlayerDetailsService :
     public DeadlockMatchPlayerDetailsService(
         DeadlockHeroCatalogService heroCatalogService,
         DeadlockPlayerStatsService playerStatsService,
+        DeadlockPlayerRankService playerRankService,
         CancellationToken lifetimeToken,
         Action<
             DeadlockMatchPlayerDetailsService,
@@ -67,6 +73,12 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                 nameof(playerStatsService)
             );
 
+        _playerRankService =
+            playerRankService ??
+            throw new ArgumentNullException(
+                nameof(playerRankService)
+            );
+
         _lifetimeToken =
             lifetimeToken;
 
@@ -77,7 +89,8 @@ internal sealed class DeadlockMatchPlayerDetailsService :
     public bool StartForRequests(
         IReadOnlyList<
             CurrentMatchPlayerHeroRequest
-        > requests
+        > requests,
+        bool includeRank
     )
     {
         ArgumentNullException.ThrowIfNull(
@@ -144,7 +157,8 @@ internal sealed class DeadlockMatchPlayerDetailsService :
 
             var fingerprint =
                 BuildFingerprint(
-                    expandedRequests
+                    expandedRequests,
+                    includeRank
                 );
 
             if (
@@ -214,6 +228,7 @@ internal sealed class DeadlockMatchPlayerDetailsService :
         var task =
             RunAsync(
                 expandedRequests,
+                includeRank,
                 currentState
             );
 
@@ -238,7 +253,8 @@ internal sealed class DeadlockMatchPlayerDetailsService :
 
     public bool StartForRoster(
         DeadlockLaneAdvisorRosterRequest roster,
-        uint ownAccountId
+        uint ownAccountId,
+        bool includeRank
     )
     {
         ArgumentNullException.ThrowIfNull(
@@ -272,7 +288,8 @@ internal sealed class DeadlockMatchPlayerDetailsService :
         var fingerprint =
             BuildRosterFingerprint(
                 rosterSnapshot,
-                ownAccountId
+                ownAccountId,
+                includeRank
             );
 
         MatchPlayerDetailsRunState?
@@ -363,6 +380,7 @@ internal sealed class DeadlockMatchPlayerDetailsService :
             RunRosterAsync(
                 rosterSnapshot,
                 ownAccountId,
+                includeRank,
                 currentState
             );
 
@@ -394,9 +412,392 @@ internal sealed class DeadlockMatchPlayerDetailsService :
         }
     }
 
+    public bool ApplyRankSnapshot(
+        CurrentMatchPlayerRanksSnapshot snapshot,
+        bool includeRank
+    )
+    {
+        ArgumentNullException.ThrowIfNull(
+            snapshot
+        );
+
+        if (!includeRank)
+        {
+            return false;
+        }
+
+        var ranksByAccountId =
+            new Dictionary<
+                uint,
+                DeadlockPlayerRankResult
+            >(
+                snapshot.Players.Count
+            );
+
+        foreach (var player in snapshot.Players)
+        {
+            if (
+                player.AccountId == 0 ||
+                !ranksByAccountId.TryAdd(
+                    player.AccountId,
+                    new DeadlockPlayerRankResult(
+                        AccountId:
+                            player.AccountId,
+
+                        Status:
+                            player.Status,
+
+                        Rank:
+                            player.Rank,
+
+                        Subrank:
+                            player.Subrank
+                    )
+                )
+            )
+            {
+                return false;
+            }
+        }
+
+        lock (_stateGate)
+        {
+            if (
+                _disposed ||
+                !String.Equals(
+                    _snapshot.Status,
+                    "ready",
+                    StringComparison.Ordinal
+                ) ||
+                _snapshot.Players.Count !=
+                    ExpectedPlayers
+            )
+            {
+                return false;
+            }
+
+            var changed =
+                false;
+
+            var players =
+                _snapshot.Players
+                    .Select(
+                        player =>
+                        {
+                            if (
+                                player.AccountId == 0 ||
+                                !ranksByAccountId.ContainsKey(
+                                    player.AccountId
+                                )
+                            )
+                            {
+                                return player;
+                            }
+
+                            var rank =
+                                GetRankFields(
+                                    player.AccountId,
+                                    includeRank:
+                                        true,
+                                    ranksByAccountId:
+                                        ranksByAccountId
+                                );
+
+                            if (
+                                ShouldKeepCurrentRank(
+                                    player.RankStatus,
+                                    rank.Status
+                                )
+                            )
+                            {
+                                return player;
+                            }
+
+                            if (
+                                String.Equals(
+                                    player.RankStatus,
+                                    rank.Status,
+                                    StringComparison.Ordinal
+                                ) &&
+                                player.Rank ==
+                                    rank.Rank &&
+                                player.Subrank ==
+                                    rank.Subrank
+                            )
+                            {
+                                return player;
+                            }
+
+                            changed =
+                                true;
+
+                            return player with
+                            {
+                                RankStatus =
+                                    rank.Status,
+
+                                Rank =
+                                    rank.Rank,
+
+                                Subrank =
+                                    rank.Subrank
+                            };
+                        }
+                    )
+                    .ToArray();
+
+            if (!changed)
+            {
+                return false;
+            }
+
+            _snapshot =
+                _snapshot with
+                {
+                    GeneratedAtUtc =
+                        DateTimeOffset.UtcNow,
+
+                    Players =
+                        players
+                };
+
+            return true;
+        }
+    }
+
+    public bool StartRankRefresh()
+    {
+        uint[] accountIds;
+        long generation;
+
+        lock (_stateGate)
+        {
+            if (
+                _disposed ||
+                !String.Equals(
+                    _snapshot.Status,
+                    "ready",
+                    StringComparison.Ordinal
+                ) ||
+                _snapshot.Players.Count !=
+                    ExpectedPlayers ||
+                _rankRefreshGeneration ==
+                    _generation
+            )
+            {
+                return false;
+            }
+
+            var candidates =
+                _snapshot.Players
+                    .Where(
+                        player =>
+                            player.AccountId != 0 &&
+                            !IsTerminalRankStatus(
+                                player.RankStatus
+                            )
+                    )
+                    .ToArray();
+
+            if (
+                candidates.Length == 0 ||
+                candidates.Any(
+                    player =>
+                        String.Equals(
+                            player.RankStatus,
+                            "loading",
+                            StringComparison.Ordinal
+                        )
+                )
+            )
+            {
+                return false;
+            }
+
+            accountIds =
+                candidates
+                    .Select(
+                        player =>
+                            player.AccountId
+                    )
+                    .Distinct()
+                    .ToArray();
+
+            generation =
+                _generation;
+
+            _rankRefreshGeneration =
+                generation;
+
+            var accountIdSet =
+                accountIds.ToHashSet();
+
+            _snapshot =
+                _snapshot with
+                {
+                    GeneratedAtUtc =
+                        DateTimeOffset.UtcNow,
+
+                    Players =
+                        _snapshot.Players
+                            .Select(
+                                player =>
+                                    accountIdSet.Contains(
+                                        player.AccountId
+                                    )
+                                        ? player with
+                                        {
+                                            RankStatus =
+                                                "loading",
+
+                                            Rank =
+                                                0,
+
+                                            Subrank =
+                                                0
+                                        }
+                                        : player
+                            )
+                            .ToArray()
+                };
+
+            _runningTasks.RemoveAll(
+                task =>
+                    task.IsCompleted
+            );
+
+            var task =
+                RefreshRanksAsync(
+                    accountIds,
+                    generation
+                );
+
+            _runningTasks.Add(
+                task
+            );
+        }
+
+        return true;
+    }
+
+    private async Task RefreshRanksAsync(
+        IReadOnlyList<uint> accountIds,
+        long generation
+    )
+    {
+        try
+        {
+            var ranksByAccountId =
+                await GetRanksByAccountIdSafelyAsync(
+                    accountIds,
+                    _lifetimeToken
+                );
+
+            lock (_stateGate)
+            {
+                if (
+                    _disposed ||
+                    generation !=
+                        _generation ||
+                    !String.Equals(
+                        _snapshot.Status,
+                        "ready",
+                        StringComparison.Ordinal
+                    )
+                )
+                {
+                    return;
+                }
+
+                var players =
+                    _snapshot.Players
+                        .Select(
+                            player =>
+                            {
+                                if (
+                                    player.AccountId == 0 ||
+                                    !ranksByAccountId.ContainsKey(
+                                        player.AccountId
+                                    )
+                                )
+                                {
+                                    return player;
+                                }
+
+                                var rank =
+                                    GetRankFields(
+                                        player.AccountId,
+                                        includeRank:
+                                            true,
+                                        ranksByAccountId:
+                                            ranksByAccountId
+                                    );
+
+                                if (
+                                    ShouldKeepCurrentRank(
+                                        player.RankStatus,
+                                        rank.Status
+                                    )
+                                )
+                                {
+                                    return player;
+                                }
+
+                                return player with
+                                {
+                                    RankStatus =
+                                        rank.Status,
+
+                                    Rank =
+                                        rank.Rank,
+
+                                    Subrank =
+                                        rank.Subrank
+                                };
+                            }
+                        )
+                        .ToArray();
+
+                _snapshot =
+                    _snapshot with
+                    {
+                        GeneratedAtUtc =
+                            DateTimeOffset.UtcNow,
+
+                        Players =
+                            players
+                    };
+            }
+        }
+        catch (
+            OperationCanceledException
+        )
+        when (
+            _lifetimeToken
+                .IsCancellationRequested
+        )
+        {
+        }
+        finally
+        {
+            lock (_stateGate)
+            {
+                if (
+                    _rankRefreshGeneration ==
+                        generation
+                )
+                {
+                    _rankRefreshGeneration =
+                        0;
+                }
+            }
+        }
+    }
+
     private async Task RunRosterAsync(
         DeadlockLaneAdvisorRosterRequest roster,
         uint ownAccountId,
+        bool includeRank,
         MatchPlayerDetailsRunState state
     )
     {
@@ -485,6 +886,15 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                         .FirstOrDefault();
             }
 
+            IReadOnlyDictionary<
+                uint,
+                DeadlockPlayerRankResult
+            > ranksByAccountId =
+                new Dictionary<
+                    uint,
+                    DeadlockPlayerRankResult
+                >();
+
             cancellationToken
                 .ThrowIfCancellationRequested();
 
@@ -526,7 +936,11 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                             heroIconUrl:
                                 null,
                             status:
-                                resolution.Status
+                                resolution.Status,
+                            includeRank:
+                                includeRank,
+                            ranksByAccountId:
+                                ranksByAccountId
                         )
                     );
 
@@ -565,7 +979,11 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                             heroName,
                             heroIconUrl,
                             status:
-                                "bot"
+                                "bot",
+                            includeRank:
+                                includeRank,
+                            ranksByAccountId:
+                                ranksByAccountId
                         )
                     );
 
@@ -586,7 +1004,11 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                             heroName,
                             heroIconUrl,
                             status:
-                                "stats-not-found"
+                                "stats-not-found",
+                            includeRank:
+                                includeRank,
+                            ranksByAccountId:
+                                ranksByAccountId
                         )
                     );
 
@@ -599,6 +1021,13 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                             .TotalPlayerDamage /
                     localStats
                         .MatchesPlayed;
+
+                var rank =
+                    GetRankFields(
+                        ownAccountId,
+                        includeRank,
+                        ranksByAccountId
+                    );
 
                 players.Add(
                     new DeadlockMatchPlayerDetailsEntry(
@@ -619,6 +1048,15 @@ internal sealed class DeadlockMatchPlayerDetailsService :
 
                         Status:
                             "ok",
+
+                        RankStatus:
+                            rank.Status,
+
+                        Rank:
+                            rank.Rank,
+
+                        Subrank:
+                            rank.Subrank,
 
                         MatchesPlayed:
                             localStats.MatchesPlayed,
@@ -664,41 +1102,16 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                         null
                 );
 
-            var published =
-                false;
-
-            lock (_stateGate)
-            {
-                if (
-                    !_disposed &&
-                    ReferenceEquals(
-                        _currentRunState,
-                        state
-                    ) &&
-                    state.Generation ==
-                        _generation
-                )
+            await PublishReadyThenEnrichRanksAsync(
+                snapshot,
+                new[]
                 {
-                    _snapshot =
-                        snapshot;
-
-                    state.Failed =
-                        false;
-
-                    published =
-                        true;
-                }
-            }
-
-            if (
-                published &&
-                snapshot.GeneratedAtUtc.HasValue
-            )
-            {
-                NotifyReady(
-                    snapshot.GeneratedAtUtc.Value
-                );
-            }
+                    ownAccountId
+                },
+                includeRank,
+                state,
+                cancellationToken
+            );
         }
         catch (
             OperationCanceledException
@@ -731,6 +1144,7 @@ internal sealed class DeadlockMatchPlayerDetailsService :
         IReadOnlyList<
             CurrentMatchPlayerHeroRequest
         > requests,
+        bool includeRank,
         MatchPlayerDetailsRunState state
     )
     {
@@ -842,6 +1256,15 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                         );
             }
 
+            IReadOnlyDictionary<
+                uint,
+                DeadlockPlayerRankResult
+            > ranksByAccountId =
+                new Dictionary<
+                    uint,
+                    DeadlockPlayerRankResult
+                >();
+
             cancellationToken
                 .ThrowIfCancellationRequested();
 
@@ -903,7 +1326,11 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                             status:
                                 request.AccountId == 0
                                     ? "identity-unresolved"
-                                    : resolution.Status
+                                    : resolution.Status,
+                            includeRank:
+                                includeRank,
+                            ranksByAccountId:
+                                ranksByAccountId
                         )
                     );
 
@@ -937,7 +1364,11 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                             heroName,
                             heroIconUrl,
                             status:
-                                "identity-unresolved"
+                                "identity-unresolved",
+                            includeRank:
+                                includeRank,
+                            ranksByAccountId:
+                                ranksByAccountId
                         )
                     );
 
@@ -963,7 +1394,11 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                             heroName,
                             heroIconUrl,
                             status:
-                                "stats-not-found"
+                                "stats-not-found",
+                            includeRank:
+                                includeRank,
+                            ranksByAccountId:
+                                ranksByAccountId
                         )
                     );
 
@@ -976,6 +1411,13 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                             .TotalPlayerDamage /
                     heroStats
                         .MatchesPlayed;
+
+                var rank =
+                    GetRankFields(
+                        request.AccountId,
+                        includeRank,
+                        ranksByAccountId
+                    );
 
                 players.Add(
                     new DeadlockMatchPlayerDetailsEntry(
@@ -996,6 +1438,15 @@ internal sealed class DeadlockMatchPlayerDetailsService :
 
                         Status:
                             "ok",
+
+                        RankStatus:
+                            rank.Status,
+
+                        Rank:
+                            rank.Rank,
+
+                        Subrank:
+                            rank.Subrank,
 
                         MatchesPlayed:
                             heroStats.MatchesPlayed,
@@ -1041,41 +1492,13 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                         null
                 );
 
-            var published =
-                false;
-
-            lock (_stateGate)
-            {
-                if (
-                    !_disposed &&
-                    ReferenceEquals(
-                        _currentRunState,
-                        state
-                    ) &&
-                    state.Generation ==
-                        _generation
-                )
-                {
-                    _snapshot =
-                        snapshot;
-
-                    state.Failed =
-                        false;
-
-                    published =
-                        true;
-                }
-            }
-
-            if (
-                published &&
-                snapshot.GeneratedAtUtc.HasValue
-            )
-            {
-                NotifyReady(
-                    snapshot.GeneratedAtUtc.Value
-                );
-            }
+            await PublishReadyThenEnrichRanksAsync(
+                snapshot,
+                resolvedAccountIds,
+                includeRank,
+                state,
+                cancellationToken
+            );
         }
         catch (
             OperationCanceledException
@@ -1111,9 +1534,21 @@ internal sealed class DeadlockMatchPlayerDetailsService :
             uint heroId,
             string heroName,
             string? heroIconUrl,
-            string status
+            string status,
+            bool includeRank,
+            IReadOnlyDictionary<
+                uint,
+                DeadlockPlayerRankResult
+            > ranksByAccountId
         )
     {
+        var rank =
+            GetRankFields(
+                accountId,
+                includeRank,
+                ranksByAccountId
+            );
+
         return new DeadlockMatchPlayerDetailsEntry(
             Index:
                 index,
@@ -1132,6 +1567,15 @@ internal sealed class DeadlockMatchPlayerDetailsService :
 
             Status:
                 status,
+
+            RankStatus:
+                rank.Status,
+
+            Rank:
+                rank.Rank,
+
+            Subrank:
+                rank.Subrank,
 
             MatchesPlayed:
                 0,
@@ -1162,9 +1606,21 @@ internal sealed class DeadlockMatchPlayerDetailsService :
             uint heroId,
             string heroName,
             string? heroIconUrl,
-            string status
+            string status,
+            bool includeRank,
+            IReadOnlyDictionary<
+                uint,
+                DeadlockPlayerRankResult
+            > ranksByAccountId
         )
     {
+        var rank =
+            GetRankFields(
+                request.AccountId,
+                includeRank,
+                ranksByAccountId
+            );
+
         return new DeadlockMatchPlayerDetailsEntry(
             Index:
                 request.Index,
@@ -1183,6 +1639,15 @@ internal sealed class DeadlockMatchPlayerDetailsService :
 
             Status:
                 status,
+
+            RankStatus:
+                rank.Status,
+
+            Rank:
+                rank.Rank,
+
+            Subrank:
+                rank.Subrank,
 
             MatchesPlayed:
                 0,
@@ -1203,6 +1668,533 @@ internal sealed class DeadlockMatchPlayerDetailsService :
                 0,
 
             AccuracyPercent:
+                0
+        );
+    }
+
+    private async Task PublishReadyThenEnrichRanksAsync(
+        DeadlockMatchPlayerDetailsSnapshot snapshot,
+        IReadOnlyList<uint> accountIds,
+        bool includeRank,
+        MatchPlayerDetailsRunState state,
+        CancellationToken cancellationToken
+    )
+    {
+        /*
+         * CURRENT HERO STATS readiness starts the delayed live-damage
+         * workflow. Rank is supplementary and may require up to twelve
+         * HTTP requests, so publish hero statistics before waiting for it.
+         */
+        if (
+            !TryPublishSnapshot(
+                state,
+                snapshot,
+                notifyReady:
+                    true
+            ) ||
+            !includeRank
+        )
+        {
+            return;
+        }
+
+        cancellationToken
+            .ThrowIfCancellationRequested();
+
+        var ranksByAccountId =
+            await GetRanksByAccountIdSafelyAsync(
+                accountIds,
+                cancellationToken
+            );
+
+        cancellationToken
+            .ThrowIfCancellationRequested();
+
+        var enrichedPlayers =
+            snapshot.Players
+                .Select(
+                    player =>
+                    {
+                        var rank =
+                            GetRankFields(
+                                player.AccountId,
+                                includeRank:
+                                    true,
+                                ranksByAccountId:
+                                    ranksByAccountId
+                            );
+
+                        return player with
+                        {
+                            RankStatus =
+                                rank.Status,
+
+                            Rank =
+                                rank.Rank,
+
+                            Subrank =
+                                rank.Subrank
+                        };
+                    }
+                )
+                .ToArray();
+
+        var enrichedSnapshot =
+            snapshot with
+            {
+                GeneratedAtUtc =
+                    DateTimeOffset.UtcNow,
+
+                Players =
+                    enrichedPlayers
+            };
+
+        TryPublishSnapshot(
+            state,
+            enrichedSnapshot,
+            notifyReady:
+                false
+        );
+    }
+
+    private bool TryPublishSnapshot(
+        MatchPlayerDetailsRunState state,
+        DeadlockMatchPlayerDetailsSnapshot snapshot,
+        bool notifyReady
+    )
+    {
+        var published =
+            false;
+
+        lock (_stateGate)
+        {
+            if (
+                !_disposed &&
+                ReferenceEquals(
+                    _currentRunState,
+                    state
+                ) &&
+                state.Generation ==
+                    _generation
+            )
+            {
+                if (
+                    !notifyReady &&
+                    String.Equals(
+                        _snapshot.Status,
+                        "ready",
+                        StringComparison.Ordinal
+                    )
+                )
+                {
+                    snapshot =
+                        PreserveTerminalRanks(
+                            _snapshot,
+                            snapshot
+                        );
+                }
+
+                _snapshot =
+                    snapshot;
+
+                state.Failed =
+                    false;
+
+                published =
+                    true;
+            }
+        }
+
+        if (
+            published &&
+            notifyReady &&
+            snapshot.GeneratedAtUtc.HasValue
+        )
+        {
+            NotifyReady(
+                snapshot.GeneratedAtUtc.Value
+            );
+        }
+
+        return published;
+    }
+
+    private static DeadlockMatchPlayerDetailsSnapshot
+        PreserveTerminalRanks(
+            DeadlockMatchPlayerDetailsSnapshot current,
+            DeadlockMatchPlayerDetailsSnapshot incoming
+        )
+    {
+        if (
+            current.Players.Count !=
+                incoming.Players.Count
+        )
+        {
+            return incoming;
+        }
+
+        var currentByIndex =
+            current.Players.ToDictionary(
+                player =>
+                    player.Index
+            );
+
+        var players =
+            incoming.Players
+                .Select(
+                    player =>
+                    {
+                        if (
+                            !currentByIndex.TryGetValue(
+                                player.Index,
+                                out var currentPlayer
+                            ) ||
+                            currentPlayer.AccountId !=
+                                player.AccountId ||
+                            !ShouldKeepCurrentRank(
+                                currentPlayer.RankStatus,
+                                player.RankStatus
+                            )
+                        )
+                        {
+                            return player;
+                        }
+
+                        return player with
+                        {
+                            RankStatus =
+                                currentPlayer.RankStatus,
+
+                            Rank =
+                                currentPlayer.Rank,
+
+                            Subrank =
+                                currentPlayer.Subrank
+                        };
+                    }
+                )
+                .ToArray();
+
+        return incoming with
+        {
+            Players =
+                players
+        };
+    }
+
+    private static bool ShouldKeepCurrentRank(
+        string currentStatus,
+        string incomingStatus
+    )
+    {
+        return
+            IsTerminalRankStatus(
+                currentStatus
+            ) &&
+            (
+                String.Equals(
+                    incomingStatus,
+                    "error",
+                    StringComparison.Ordinal
+                ) ||
+                String.Equals(
+                    incomingStatus,
+                    "loading",
+                    StringComparison.Ordinal
+                )
+            );
+    }
+
+    private static bool IsTerminalRankStatus(
+        string status
+    )
+    {
+        return
+            String.Equals(
+                status,
+                "ok",
+                StringComparison.Ordinal
+            ) ||
+            String.Equals(
+                status,
+                "unranked",
+                StringComparison.Ordinal
+            ) ||
+            String.Equals(
+                status,
+                "protected",
+                StringComparison.Ordinal
+            ) ||
+            String.Equals(
+                status,
+                "not_found",
+                StringComparison.Ordinal
+            );
+    }
+
+    private async Task<
+        IReadOnlyDictionary<
+            uint,
+            DeadlockPlayerRankResult
+        >
+    > GetRanksByAccountIdSafelyAsync(
+        IReadOnlyList<uint> accountIds,
+        CancellationToken cancellationToken
+    )
+    {
+        if (accountIds.Count == 0)
+        {
+            return new Dictionary<
+                uint,
+                DeadlockPlayerRankResult
+            >();
+        }
+
+        try
+        {
+            var results =
+                await _playerRankService
+                    .GetRanksAsync(
+                        accountIds,
+                        cancellationToken
+                    );
+
+            if (
+                results.Count !=
+                    accountIds.Count
+            )
+            {
+                return CreateRankErrorResults(
+                    accountIds
+                );
+            }
+
+            var byAccountId =
+                new Dictionary<
+                    uint,
+                    DeadlockPlayerRankResult
+                >(
+                    accountIds.Count
+                );
+
+            for (
+                var index = 0;
+                index < accountIds.Count;
+                index++
+            )
+            {
+                var accountId =
+                    accountIds[index];
+
+                var result =
+                    results[index];
+
+                if (
+                    accountId == 0 ||
+                    result.AccountId !=
+                        accountId ||
+                    !byAccountId.TryAdd(
+                        accountId,
+                        result
+                    )
+                )
+                {
+                    return CreateRankErrorResults(
+                        accountIds
+                    );
+                }
+            }
+
+            return byAccountId;
+        }
+        catch (
+            OperationCanceledException
+        )
+        when (
+            cancellationToken
+                .IsCancellationRequested
+        )
+        {
+            throw;
+        }
+        catch
+        {
+            /*
+             * Rank is supplementary desktop data. A rank API or
+             * transport failure must not discard otherwise valid
+             * hero statistics for the whole snapshot.
+             */
+            return CreateRankErrorResults(
+                accountIds
+            );
+        }
+    }
+
+    private static IReadOnlyDictionary<
+        uint,
+        DeadlockPlayerRankResult
+    > CreateRankErrorResults(
+        IReadOnlyList<uint> accountIds
+    )
+    {
+        var results =
+            new Dictionary<
+                uint,
+                DeadlockPlayerRankResult
+            >(
+                accountIds.Count
+            );
+
+        foreach (var accountId in accountIds)
+        {
+            if (accountId == 0)
+            {
+                continue;
+            }
+
+            results[accountId] =
+                new DeadlockPlayerRankResult(
+                    AccountId:
+                        accountId,
+
+                    Status:
+                        DeadlockPlayerRankStatus
+                            .ApiError,
+
+                    Rank:
+                        0,
+
+                    Subrank:
+                        0
+                );
+        }
+
+        return results;
+    }
+
+    private static (
+        string Status,
+        byte Rank,
+        byte Subrank
+    ) GetRankFields(
+        uint accountId,
+        bool includeRank,
+        IReadOnlyDictionary<
+            uint,
+            DeadlockPlayerRankResult
+        > ranksByAccountId
+    )
+    {
+        if (!includeRank)
+        {
+            return (
+                Status:
+                    "disabled",
+
+                Rank:
+                    0,
+
+                Subrank:
+                    0
+            );
+        }
+
+        if (accountId == 0)
+        {
+            return (
+                Status:
+                    "unavailable",
+
+                Rank:
+                    0,
+
+                Subrank:
+                    0
+            );
+        }
+
+        if (
+            !ranksByAccountId.TryGetValue(
+                accountId,
+                out var result
+            )
+        )
+        {
+            return (
+                Status:
+                    "loading",
+
+                Rank:
+                    0,
+
+                Subrank:
+                    0
+            );
+        }
+
+        if (
+            result.Status ==
+                DeadlockPlayerRankStatus.Ok
+        )
+        {
+            if (
+                result.Rank >= 1 &&
+                result.Rank <= 11 &&
+                result.Subrank >= 1 &&
+                result.Subrank <= 6
+            )
+            {
+                return (
+                    Status:
+                        "ok",
+
+                    Rank:
+                        result.Rank,
+
+                    Subrank:
+                        result.Subrank
+                );
+            }
+
+            return (
+                Status:
+                    "error",
+
+                Rank:
+                    0,
+
+                Subrank:
+                    0
+            );
+        }
+
+        var status =
+            result.Status switch
+            {
+                DeadlockPlayerRankStatus
+                    .Unranked =>
+                        "unranked",
+
+                DeadlockPlayerRankStatus
+                    .Protected =>
+                        "protected",
+
+                DeadlockPlayerRankStatus
+                    .NotFound =>
+                        "not_found",
+
+                _ =>
+                    "error"
+            };
+
+        return (
+            Status:
+                status,
+
+            Rank:
+                0,
+
+            Subrank:
                 0
         );
     }
@@ -1467,7 +2459,8 @@ internal sealed class DeadlockMatchPlayerDetailsService :
 
     private static string BuildRosterFingerprint(
         DeadlockLaneAdvisorRosterRequest roster,
-        uint ownAccountId
+        uint ownAccountId,
+        bool includeRank
     )
     {
         return (
@@ -1475,6 +2468,12 @@ internal sealed class DeadlockMatchPlayerDetailsService :
             ownAccountId +
             ":" +
             roster.LocalIndex +
+            ":rank=" +
+            (
+                includeRank
+                    ? "1"
+                    : "0"
+            ) +
             "|" +
             String.Join(
                 "|",
@@ -1492,21 +2491,31 @@ internal sealed class DeadlockMatchPlayerDetailsService :
     private static string BuildFingerprint(
         IReadOnlyList<
             CurrentMatchPlayerHeroRequest
-        > requests
+        > requests,
+        bool includeRank
     )
     {
-        return String.Join(
-            "|",
-            requests.Select(
-                request =>
-                    request.Index +
-                    ":" +
-                    request.AccountId +
-                    ":" +
-                    DeadlockHeroCatalogService
-                        .NormalizeName(
-                            request.HeroName
-                        )
+        return (
+            "rank=" +
+            (
+                includeRank
+                    ? "1"
+                    : "0"
+            ) +
+            "|" +
+            String.Join(
+                "|",
+                requests.Select(
+                    request =>
+                        request.Index +
+                        ":" +
+                        request.AccountId +
+                        ":" +
+                        DeadlockHeroCatalogService
+                            .NormalizeName(
+                                request.HeroName
+                            )
+                )
             )
         );
     }
@@ -1721,6 +2730,9 @@ internal sealed record DeadlockMatchPlayerDetailsEntry(
     string HeroName,
     string? HeroIconUrl,
     string Status,
+    string RankStatus,
+    byte Rank,
+    byte Subrank,
     ulong MatchesPlayed,
     ulong Wins,
     double WinRatePercent,

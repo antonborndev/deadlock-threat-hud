@@ -19,6 +19,9 @@ internal sealed class DeadlockLaneAdvisorService :
     private const int ExpectedOptions =
         5;
 
+    private const int ExpectedCurrentLanes =
+        3;
+
     private const int MaximumDiagnosticEvents =
         500;
 
@@ -258,6 +261,43 @@ internal sealed class DeadlockLaneAdvisorService :
         );
     }
 
+    public void ResetForMatchTransition()
+    {
+        LaneAdvisorRunState?
+            previousState;
+
+        lock (_stateGate)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            ++_generation;
+
+            _currentFingerprint =
+                null;
+
+            previousState =
+                _currentRunState;
+
+            _currentRunState =
+                null;
+
+            _runningTasks.RemoveAll(
+                task =>
+                    task.IsCompleted
+            );
+        }
+
+        if (previousState is not null)
+        {
+            CancelRunState(
+                previousState
+            );
+        }
+    }
+
     public byte[] BuildResultPacket(
         long rosterVersion,
         out DeadlockLaneAdvisorResultState resultState
@@ -324,6 +364,25 @@ internal sealed class DeadlockLaneAdvisorService :
                     item.Id
             )
             .ToArray();
+    }
+
+    public DeadlockCurrentLaneStatsSnapshot?
+        GetCurrentLaneStatsSnapshot()
+    {
+        lock (_stateGate)
+        {
+            if (
+                _disposed ||
+                _currentRunState is null ||
+                _currentRunState.Failed
+            )
+            {
+                return null;
+            }
+
+            return _currentRunState
+                .CurrentLaneStats;
+        }
     }
 
     private async Task RunAsync(
@@ -441,6 +500,20 @@ internal sealed class DeadlockLaneAdvisorService :
                     matchupRows
                 );
 
+            var currentLaneStats =
+                new DeadlockCurrentLaneStatsSnapshot(
+                    HeroIds:
+                        Array.AsReadOnly(
+                            heroIds.ToArray()
+                        ),
+
+                    Lanes:
+                        BuildCurrentLaneStats(
+                            heroIds,
+                            matchupRows
+                        )
+                );
+
             Publish(
                 state.Generation,
                 BuildDiagnosticLines(
@@ -467,6 +540,9 @@ internal sealed class DeadlockLaneAdvisorService :
                 {
                     state.Packet =
                         packet;
+
+                    state.CurrentLaneStats =
+                        currentLaneStats;
 
                     state.Failed =
                         false;
@@ -550,121 +626,56 @@ internal sealed class DeadlockLaneAdvisorService :
                         ]
                     : "STAY";
 
-            var rows =
-                matchupRows
-                    .Where(
-                        row =>
-                            PairMatches(
-                                row.HeroIds,
-                                heroIds[
-                                    localIndex
-                                ],
-                                heroIds[
-                                    option
-                                        .TeammateIndex
-                                ]
-                            ) &&
-                            PairMatches(
-                                row.EnemyHeroIds,
-                                heroIds[
-                                    option
-                                        .EnemyIndex1
-                                ],
-                                heroIds[
-                                    option
-                                        .EnemyIndex2
-                                ]
-                            )
-                    )
-                    .ToArray();
-
-            ulong matches =
-                0;
-
-            ulong wins =
-                0;
-
-            ulong netWorthMatches =
-                0;
-
-            double weightedNetWorth =
-                0;
-
-            for (
-                var index = 0;
-                index < rows.Length;
-                index++
-            )
-            {
-                var row =
-                    rows[index];
-
-                matches =
-                    checked(
-                        matches +
-                        row.MatchesPlayed
-                    );
-
-                wins =
-                    checked(
-                        wins +
-                        row.Wins
-                    );
-
-                netWorthMatches =
-                    checked(
-                        netWorthMatches +
-                        row.NetWorthMatches
-                    );
-
-                weightedNetWorth +=
-                    row.NetWorthDiff15Min *
-                    row.NetWorthMatches;
-            }
-
-            var hasMatchData =
-                rows.Length > 0 &&
-                matches > 0;
-
-            var hasNetWorthData =
-                netWorthMatches > 0;
-
-            var netWorthDiff15 =
-                hasNetWorthData
-                    ? weightedNetWorth /
-                        netWorthMatches
-                    : 0;
+            var aggregate =
+                AggregateLaneMatchup(
+                    matchupRows,
+                    heroIds[
+                        localIndex
+                    ],
+                    heroIds[
+                        option
+                            .TeammateIndex
+                    ],
+                    heroIds[
+                        option
+                            .EnemyIndex1
+                    ],
+                    heroIds[
+                        option
+                            .EnemyIndex2
+                    ]
+                );
 
             var confidenceWeight =
-                hasNetWorthData
-                    ? (double)netWorthMatches /
+                aggregate.HasNetWorthData
+                    ? (double)aggregate.NetWorthMatches /
                         (
-                            netWorthMatches +
+                            aggregate.NetWorthMatches +
                             ConfidencePriorMatches
                         )
                     : 0;
 
             var confidenceLevel =
-                !hasNetWorthData ||
-                netWorthMatches <
+                !aggregate.HasNetWorthData ||
+                aggregate.NetWorthMatches <
                     MinimumLowConfidenceMatches
                     ? "INSUFFICIENT"
-                    : netWorthMatches <
+                    : aggregate.NetWorthMatches <
                         MinimumRecommendationMatches
                         ? "LOW"
-                        : netWorthMatches <
+                        : aggregate.NetWorthMatches <
                             HighConfidenceMatches
                             ? "MEDIUM"
                             : "HIGH";
 
             var eligible =
-                hasNetWorthData &&
-                netWorthMatches >=
+                aggregate.HasNetWorthData &&
+                aggregate.NetWorthMatches >=
                     MinimumRecommendationMatches;
 
             var adjustedScore =
-                hasNetWorthData
-                    ? netWorthDiff15 *
+                aggregate.HasNetWorthData
+                    ? aggregate.NetWorthDiff15 *
                         confidenceWeight
                     : 0;
 
@@ -677,25 +688,25 @@ internal sealed class DeadlockLaneAdvisorService :
                         label,
 
                     LaneRows:
-                        rows.Length,
+                        aggregate.LaneRows,
 
                     HasMatchData:
-                        hasMatchData,
+                        aggregate.HasMatchData,
 
                     Matches:
-                        matches,
+                        aggregate.Matches,
 
                     Wins:
-                        wins,
+                        aggregate.Wins,
 
                     HasNetWorthData:
-                        hasNetWorthData,
+                        aggregate.HasNetWorthData,
 
                     NetWorthDiff15:
-                        netWorthDiff15,
+                        aggregate.NetWorthDiff15,
 
                     NetWorthMatches:
-                        netWorthMatches,
+                        aggregate.NetWorthMatches,
 
                     ConfidenceWeight:
                         confidenceWeight,
@@ -779,6 +790,213 @@ internal sealed class DeadlockLaneAdvisorService :
 
             ImprovementVsStay:
                 improvementVsStay
+        );
+    }
+
+    private static IReadOnlyList<
+        DeadlockCurrentLaneStatsEntry
+    > BuildCurrentLaneStats(
+        IReadOnlyList<uint> heroIds,
+        IReadOnlyList<
+            DeadlockLaneMatchupStats
+        > matchupRows
+    )
+    {
+        if (
+            heroIds.Count !=
+                ExpectedPlayers
+        )
+        {
+            throw new InvalidOperationException(
+                "Current lane stats require exactly " +
+                ExpectedPlayers +
+                " hero IDs."
+            );
+        }
+
+        var lanes =
+            new List<
+                DeadlockCurrentLaneStatsEntry
+            >(
+                ExpectedCurrentLanes
+            );
+
+        for (
+            var laneIndex = 0;
+            laneIndex <
+                ExpectedCurrentLanes;
+            laneIndex++
+        )
+        {
+            var allyIndex =
+                laneIndex *
+                2;
+
+            var enemyIndex =
+                TeamSize +
+                allyIndex;
+
+            var aggregate =
+                AggregateLaneMatchup(
+                    matchupRows,
+                    heroIds[
+                        allyIndex
+                    ],
+                    heroIds[
+                        allyIndex + 1
+                    ],
+                    heroIds[
+                        enemyIndex
+                    ],
+                    heroIds[
+                        enemyIndex + 1
+                    ]
+                );
+
+            lanes.Add(
+                new DeadlockCurrentLaneStatsEntry(
+                    LaneIndex:
+                        laneIndex,
+
+                    HasMatchData:
+                        aggregate.HasMatchData,
+
+                    WinRatePercent:
+                        aggregate.HasMatchData
+                            ? 100.0 *
+                                aggregate.Wins /
+                                aggregate.Matches
+                            : null,
+
+                    Matches:
+                        aggregate.Matches,
+
+                    HasNetWorthData:
+                        aggregate.HasNetWorthData,
+
+                    NetWorthDiff15:
+                        aggregate.HasNetWorthData
+                            ? aggregate.NetWorthDiff15
+                            : null,
+
+                    NetWorthMatches:
+                        aggregate.NetWorthMatches
+                )
+            );
+        }
+
+        return Array.AsReadOnly(
+            lanes.ToArray()
+        );
+    }
+
+    private static LaneMatchupAggregate
+        AggregateLaneMatchup(
+            IReadOnlyList<
+                DeadlockLaneMatchupStats
+            > matchupRows,
+            uint allyHero1,
+            uint allyHero2,
+            uint enemyHero1,
+            uint enemyHero2
+        )
+    {
+        var laneRows =
+            0;
+
+        ulong matches =
+            0;
+
+        ulong wins =
+            0;
+
+        ulong netWorthMatches =
+            0;
+
+        double weightedNetWorth =
+            0;
+
+        foreach (var row in matchupRows)
+        {
+            if (
+                !PairMatches(
+                    row.HeroIds,
+                    allyHero1,
+                    allyHero2
+                ) ||
+                !PairMatches(
+                    row.EnemyHeroIds,
+                    enemyHero1,
+                    enemyHero2
+                )
+            )
+            {
+                continue;
+            }
+
+            laneRows +=
+                1;
+
+            matches =
+                checked(
+                    matches +
+                    row.MatchesPlayed
+                );
+
+            wins =
+                checked(
+                    wins +
+                    row.Wins
+                );
+
+            var rowNetWorthMatches =
+                row.NetWorthMatches;
+
+            netWorthMatches =
+                checked(
+                    netWorthMatches +
+                    rowNetWorthMatches
+                );
+
+            if (rowNetWorthMatches > 0)
+            {
+                weightedNetWorth +=
+                    row.NetWorthDiff15Min *
+                    rowNetWorthMatches;
+            }
+        }
+
+        var hasMatchData =
+            laneRows > 0 &&
+            matches > 0;
+
+        var hasNetWorthData =
+            netWorthMatches > 0;
+
+        return new LaneMatchupAggregate(
+            LaneRows:
+                laneRows,
+
+            HasMatchData:
+                hasMatchData,
+
+            Matches:
+                matches,
+
+            Wins:
+                wins,
+
+            HasNetWorthData:
+                hasNetWorthData,
+
+            NetWorthDiff15:
+                hasNetWorthData
+                    ? weightedNetWorth /
+                        netWorthMatches
+                    : 0,
+
+            NetWorthMatches:
+                netWorthMatches
         );
     }
 
@@ -1488,6 +1706,9 @@ internal sealed class DeadlockLaneAdvisorService :
             state.Packet =
                 null;
 
+            state.CurrentLaneStats =
+                null;
+
             state.Failed =
                 true;
         }
@@ -1604,6 +1825,13 @@ internal sealed class DeadlockLaneAdvisorService :
             set;
         }
 
+        public DeadlockCurrentLaneStatsSnapshot?
+            CurrentLaneStats
+        {
+            get;
+            set;
+        }
+
         public bool Failed
         {
             get;
@@ -1645,7 +1873,36 @@ internal sealed class DeadlockLaneAdvisorService :
         int BestOptionIndex,
         double? ImprovementVsStay
     );
+
+    private sealed record LaneMatchupAggregate(
+        int LaneRows,
+        bool HasMatchData,
+        ulong Matches,
+        ulong Wins,
+        bool HasNetWorthData,
+        double NetWorthDiff15,
+        ulong NetWorthMatches
+    );
 }
+
+internal sealed record
+    DeadlockCurrentLaneStatsSnapshot(
+        IReadOnlyList<uint> HeroIds,
+        IReadOnlyList<
+            DeadlockCurrentLaneStatsEntry
+        > Lanes
+    );
+
+internal sealed record
+    DeadlockCurrentLaneStatsEntry(
+        int LaneIndex,
+        bool HasMatchData,
+        double? WinRatePercent,
+        ulong Matches,
+        bool HasNetWorthData,
+        double? NetWorthDiff15,
+        ulong NetWorthMatches
+    );
 
 internal enum DeadlockLaneAdvisorResultState
 {

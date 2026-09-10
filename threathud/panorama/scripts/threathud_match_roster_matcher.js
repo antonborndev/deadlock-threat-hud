@@ -6,6 +6,23 @@ var ThreatHud = ThreatHud || {};
 	var EXPECTED_PLAYERS =
 		12;
 
+	var ALLY_PLAYERS =
+		6;
+
+	function hasLocalPlayerClass(panel) {
+		try {
+			return !!(
+				panel &&
+				typeof panel.IsValid === 'function' &&
+				panel.IsValid() &&
+				typeof panel.BHasClass === 'function' &&
+				panel.BHasClass('LocalPlayer')
+			);
+		} catch (error) {
+			return false;
+		}
+	}
+
 	function normalizeName(value) {
 		/*
 		 * Intentionally do not call:
@@ -262,6 +279,21 @@ var ThreatHud = ThreatHud || {};
 			var pendingCount =
 				0;
 
+			var localPanelFlags = [];
+			var localPanelCount = 0;
+
+			for (var panelIndex = 0; panelIndex < rosterPlayers.length; panelIndex++) {
+				var localPanel = hasLocalPlayerClass(
+					rosterPlayers[panelIndex].panel
+				);
+
+				localPanelFlags.push(localPanel);
+
+				if (localPanel) {
+					localPanelCount++;
+				}
+			}
+
 			for (
 				var rosterIndex = 0;
 				rosterIndex <
@@ -278,16 +310,29 @@ var ThreatHud = ThreatHud || {};
 						rosterPlayer.playerName
 					);
 
+				var isLocalPanel = localPanelFlags[rosterIndex];
+				var canMatchLocal =
+					isLocalPanel &&
+					localPanelCount === 1 &&
+					rosterIndex < ALLY_PLAYERS &&
+					rosterPlayer.team === 'ally';
+
+				/*
+				 * The HUD local-player marker is authoritative even when
+				 * Steam Recent contains another account with the same name.
+				 * Never resolve a marked local panel by another user's name.
+				 */
 				var rosterNameCount =
-					this._countRosterName(
+					isLocalPanel ? 1 : this._countRosterName(
 						rosterPlayers,
 						normalizedPlayerName
 					);
 
 				var identityCandidates =
-					this._findIdentityCandidates(
+					isLocalPanel && !canMatchLocal ? [] : this._findIdentityCandidates(
 						identityPlayers,
-						normalizedPlayerName
+						normalizedPlayerName,
+						isLocalPanel
 					);
 
 				var status =
@@ -297,7 +342,7 @@ var ThreatHud = ThreatHud || {};
 					null;
 
 				if (
-					normalizedPlayerName === '' ||
+					(!isLocalPanel && normalizedPlayerName === '') ||
 					identityCandidates.length === 0
 				) {
 					status =
@@ -397,7 +442,8 @@ var ThreatHud = ThreatHud || {};
 		._findIdentityCandidates =
 		function (
 			identityPlayers,
-			normalizedName
+			normalizedName,
+			isLocalPlayer
 		) {
 			var result =
 				[];
@@ -412,9 +458,13 @@ var ThreatHud = ThreatHud || {};
 					identityPlayers[index];
 
 				if (
-					normalizeName(
-						identity.personaName
-					) === normalizedName
+					!!identity.isLocal === !!isLocalPlayer &&
+					(
+						isLocalPlayer ||
+						normalizeName(
+							identity.personaName
+						) === normalizedName
+					)
 				) {
 					result.push(
 						identity

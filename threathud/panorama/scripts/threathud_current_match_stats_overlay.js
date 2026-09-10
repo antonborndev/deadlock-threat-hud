@@ -18,6 +18,9 @@ var ThreatHud = ThreatHud || {};
     var REACTION_IMAGE_ID =
         'ThreatHudStatsReactionImage';
 
+    var OVERLAY_WIDTH = 72;
+    var OVERLAY_HEIGHT = 24;
+
     var ReactionValue =
         ThreatHud.PlayerReactionValue;
 
@@ -314,8 +317,16 @@ var ThreatHud = ThreatHud || {};
                 return false;
             }
 
+            var isEnemy =
+                player.rosterIndex >= PLAYERS_PER_TEAM &&
+                player.rosterIndex < EXPECTED_PLAYERS;
+
+            var horizontalAlign =
+                isEnemy ? 'right' : 'left';
+
             this._configureOverlay(
-                overlay
+                overlay,
+                isEnemy
             );
 
             var gamesLabel =
@@ -351,25 +362,43 @@ var ThreatHud = ThreatHud || {};
             this._configureTextLabel(
                 gamesLabel,
                 {
-                    width:
-                        '100%',
+                    maxWidth:
+                        '52px',
+
+                    height:
+                        '13px',
+
+                    fontSize:
+                        '10px',
+
+                    horizontalAlign:
+                        horizontalAlign,
 
                     position:
-                        '0px 0px 0px',
+                        '0px 10px 0px',
 
                     color:
-                        '#F3F0E4'
+                        '#FFFFFF'
                 }
             );
 
             this._configureTextLabel(
                 winRateLabel,
                 {
-                    width:
-                        '54px',
+                    maxWidth:
+                        '72px',
+
+                    height:
+                        '16px',
+
+                    fontSize:
+                        '12px',
+
+                    horizontalAlign:
+                        horizontalAlign,
 
                     position:
-                        '9px 12px 0px',
+                        '0px 0px 0px',
 
                     color:
                         '#FFFFFF'
@@ -383,7 +412,7 @@ var ThreatHud = ThreatHud || {};
                 'top';
 
             reactionImage.style.position =
-                '3px 7px 0px';
+                (isEnemy ? '6px' : '56px') + ' 11px 0px';
 
             reactionImage.style.zIndex =
                 '1001';
@@ -459,7 +488,7 @@ var ThreatHud = ThreatHud || {};
         };
 
     CurrentMatchStatsOverlay.prototype._configureOverlay =
-        function (overlay) {
+        function (overlay, isEnemy) {
             overlay.hittest =
                 false;
 
@@ -467,34 +496,52 @@ var ThreatHud = ThreatHud || {};
                 true;
 
             overlay.style.width =
-                '64px';
+                OVERLAY_WIDTH + 'px';
 
             overlay.style.height =
-                '26px';
+                OVERLAY_HEIGHT + 'px';
 
             overlay.style.flowChildren =
                 'none';
 
             overlay.style.horizontalAlign =
-                'center';
+                isEnemy ? 'right' : 'left';
 
             overlay.style.verticalAlign =
                 'top';
 
+            // Align visible glyph edges to the black health-bar border.
+            // Account for rotation when matching the two visible vertical gaps.
             overlay.style.position =
-                '0px 2px 0px';
+                isEnemy ? '7px 10px 0px' : '1.5px 10.5px 0px';
+
+            // Mirror the layout around the health-bar side, keeping text readable.
+            overlay.style.transformOrigin =
+                isEnemy ? '100% 0%' : '0% 0%';
+
+            overlay.style.transform =
+                isEnemy ? 'rotateZ(9deg)' : 'rotateZ(-11deg)';
+
+            overlay.style.overflow =
+                'noclip';
 
             overlay.style.backgroundColor =
-                '#111111E8';
+                '#00000000';
 
             overlay.style.border =
-                '1px solid #FFFFFF45';
+                '0px solid #00000000';
 
             overlay.style.borderRadius =
-                '3px';
+                '0px';
 
             overlay.style.zIndex =
                 '1000';
+
+            // A reused panel may still contain the previous textured backdrop.
+            var oldBackdrop = overlay.FindChild('ThreatHudStatsBackdrop');
+            if (isValidPanel(oldBackdrop)) {
+                oldBackdrop.visible = false;
+            }
         };
 
     CurrentMatchStatsOverlay.prototype._configureTextLabel =
@@ -506,25 +553,31 @@ var ThreatHud = ThreatHud || {};
                 false;
 
             label.style.width =
-                options.width;
+                'fit-children';
+
+            label.style.maxWidth =
+                options.maxWidth;
 
             label.style.height =
-                '12px';
+                options.height;
 
             label.style.fontSize =
-                '10px';
+                options.fontSize;
 
             label.style.fontWeight =
                 'bold';
+
+            label.style.fontFamily =
+                'VALVEOracle';
 
             label.style.color =
                 options.color;
 
             label.style.textAlign =
-                'center';
+                options.horizontalAlign;
 
             label.style.horizontalAlign =
-                'left';
+                options.horizontalAlign;
 
             label.style.verticalAlign =
                 'top';
@@ -534,6 +587,15 @@ var ThreatHud = ThreatHud || {};
 
             label.style.textOverflow =
                 'shrink';
+
+            label.style.whiteSpace =
+                'nowrap';
+
+            label.style.textShadow =
+                '0px 0px 2px 3.0 #000000';
+
+            label.style.zIndex =
+                '1';
         };
 
     CurrentMatchStatsOverlay.prototype._findReactionImage =
@@ -573,17 +635,17 @@ var ThreatHud = ThreatHud || {};
             ) {
                 return String(
                     player.matchesPlayed
-                );
+                ) + ' M';
             }
 
             if (
                 player.status ===
                     'stats-not-found'
             ) {
-                return '0';
+                return '0 M';
             }
 
-            return '?';
+            return '? M';
         };
 
     CurrentMatchStatsOverlay.prototype._formatWinRate =
@@ -594,11 +656,11 @@ var ThreatHud = ThreatHud || {};
             ) {
                 return (
                     player.winRatePercent.toFixed(1) +
-                    '% WR'
+                    '%'
                 );
             }
 
-            return '— WR';
+            return '—';
         };
 
     CurrentMatchStatsOverlay.prototype._getWinRateColor =
@@ -614,14 +676,14 @@ var ThreatHud = ThreatHud || {};
                 player.winRatePercent >=
                     55
             ) {
-                return '#8FE88F';
+                return '#00A704';
             }
 
             if (
                 player.winRatePercent <
                     45
             ) {
-                return '#FF9292';
+                return '#FF0000';
             }
 
             return '#FFFFFF';

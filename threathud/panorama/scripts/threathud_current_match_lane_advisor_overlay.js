@@ -12,8 +12,10 @@ var ThreatHud = ThreatHud || {};
 	var OVERLAY_ID =
 		'ThreatHudLaneAdvisorStats';
 
-	var WR_LABEL_ID =
-		'ThreatHudLaneAdvisorWinRate';
+	var SOULS_ROW_ID = 'ThreatHudLaneAdvisorSoulsRow';
+	var SOULS_ICON_ID = 'ThreatHudLaneAdvisorSoulsIcon';
+	var MATCHES_LABEL_ID = 'ThreatHudLaneAdvisorMatches';
+	var SOULS_ICON_IMAGE = 's2r://panorama/images/hud/icons/icon_soul.vsvg';
 
 	var SOULS_LABEL_ID =
 		'ThreatHudLaneAdvisorSouls15';
@@ -28,10 +30,7 @@ var ThreatHud = ThreatHud || {};
 		35;
 
 	var OVERLAY_BACKGROUND =
-		'#080808d8';
-
-	var OVERLAY_BORDER =
-		'1px solid #ffffff24';
+		'#221c18ee';
 
 	/*
 	 * Highlight BEST using the entire block.
@@ -40,10 +39,26 @@ var ThreatHud = ThreatHud || {};
 	 * working Threat HUD styles.
 	 */
 	var BEST_BACKGROUND =
-		'#62349be8';
+		'#B684EB';
 
-	var BEST_BORDER =
-		'1px solid #c89cff';
+	var BACKDROP_ID = 'ThreatHudLaneAdvisorBackdrop';
+	var BACKDROP_IMAGE_ID = 'ThreatHudLaneAdvisorBackdropImage';
+	var BACKDROP_COLUMNS = 4;
+	var BACKDROP_ROWS = 3;
+	var BACKDROP_VARIANTS = BACKDROP_COLUMNS * BACKDROP_ROWS;
+	var BACKDROP_IMAGE =
+		's2r://panorama/images/custom_game/threathud_lane_blocks/block_shapes.vtex';
+
+	var FLAME_ID = 'ThreatHudLaneAdvisorFlame';
+	var FLAME_ATLAS_ID = 'ThreatHudLaneAdvisorFlameAtlas';
+	var FLAME_FRAME_COUNT = 49;
+	var FLAME_ATLAS_COLUMNS = 7;
+	var FLAME_ATLAS_ROWS = 7;
+	var FLAME_FRAME_INTERVAL = 0.1;
+	var FLAME_SIZE = 104;
+	var FLAME_OPACITY = '0.8';
+	var FLAME_ATLAS_IMAGE =
+		's2r://panorama/images/custom_game/threathud_lane_flame/flame_atlas.vtex';
 
 	var VISIBILITY_CHECK_INTERVAL =
 		0.25;
@@ -65,6 +80,11 @@ var ThreatHud = ThreatHud || {};
 
 		this._visibilityGeneration =
 			0;
+
+		this._flameEntries = [];
+		this._flameGeneration = 0;
+		this._flameSchedule = null;
+		this._flameRunning = false;
 	}
 
 	function isValidPanel(panel) {
@@ -269,6 +289,9 @@ var ThreatHud = ThreatHud || {};
 
 	CurrentMatchLaneAdvisorOverlay.prototype.clear =
 		function () {
+			this._stopFlameAnimation();
+			this._flameEntries = [];
+
 			this._visibilityGeneration +=
 				1;
 
@@ -504,6 +527,12 @@ var ThreatHud = ThreatHud || {};
 				overlay.visible =
 					!!visible;
 			}
+
+			if (visible) {
+				this._startFlameAnimation();
+			} else {
+				this._stopFlameAnimation();
+			}
 		};
 
 	CurrentMatchLaneAdvisorOverlay.prototype
@@ -612,87 +641,69 @@ var ThreatHud = ThreatHud || {};
 					false;
 			}
 
-			var winRateLabel =
-				overlay.FindChild(
-					WR_LABEL_ID
-				);
+			var backdrop = this._prepareBackdrop(overlay);
+			if (!isValidPanel(backdrop)) { return false; }
 
-			if (
-				!isValidPanel(
-					winRateLabel
-				)
-			) {
-				winRateLabel =
-					$.CreatePanel(
-						'Label',
-						overlay,
-						WR_LABEL_ID
-					);
-
-				if (
-					!isValidPanel(
-						winRateLabel
-					)
-				) {
-					return false;
-				}
-
-				this._configureLabel(
-					winRateLabel,
-					3
-				);
+			var soulsRow = overlay.FindChild(SOULS_ROW_ID);
+			if (!isValidPanel(soulsRow)) {
+				soulsRow = $.CreatePanel('Panel', overlay, SOULS_ROW_ID);
+				if (!isValidPanel(soulsRow)) { return false; }
+				soulsRow.hittest = false;
+				soulsRow.hittestchildren = false;
+				soulsRow.style.width = 'fit-children';
+				soulsRow.style.maxWidth = '78px';
+				soulsRow.style.height = '20px';
+				soulsRow.style.horizontalAlign = 'center';
+				soulsRow.style.verticalAlign = 'top';
+				soulsRow.style.position = '0px 1px 0px';
+				soulsRow.style.flowChildren = 'right';
+				soulsRow.style.zIndex = '1';
 			}
 
-			var soulsLabel =
-				overlay.FindChild(
-					SOULS_LABEL_ID
-				);
-
-			if (
-				!isValidPanel(
-					soulsLabel
-				)
-			) {
-				soulsLabel =
-					$.CreatePanel(
-						'Label',
-						overlay,
-						SOULS_LABEL_ID
-					);
-
-				if (
-					!isValidPanel(
-						soulsLabel
-					)
-				) {
-					return false;
-				}
-
-				this._configureLabel(
-					soulsLabel,
-					18
-				);
+			var soulsLabel = soulsRow.FindChild(SOULS_LABEL_ID);
+			if (!isValidPanel(soulsLabel)) {
+				soulsLabel = $.CreatePanel('Label', soulsRow, SOULS_LABEL_ID);
+				if (!isValidPanel(soulsLabel)) { return false; }
+				this._configureLabel(soulsLabel, 0);
+				soulsLabel.style.width = 'fit-children';
+				soulsLabel.style.maxWidth = '65px';
+				soulsLabel.style.height = '20px';
+				soulsLabel.style.horizontalAlign = 'left';
+				soulsLabel.style.verticalAlign = 'middle';
+				soulsLabel.style.fontSize = '16px';
+				soulsLabel.style.whiteSpace = 'nowrap';
 			}
 
-			winRateLabel.text =
-				this._formatWinRate(
-					option
-				);
+			var soulsIcon = soulsRow.FindChild(SOULS_ICON_ID);
+			if (!isValidPanel(soulsIcon)) {
+				soulsIcon = $.CreatePanel('Panel', soulsRow, SOULS_ICON_ID);
+				if (!isValidPanel(soulsIcon)) { return false; }
+				soulsIcon.hittest = false;
+				soulsIcon.style.width = '10px';
+				soulsIcon.style.height = '18px';
+				soulsIcon.style.marginLeft = '3px';
+				soulsIcon.style.verticalAlign = 'middle';
+				soulsIcon.style.backgroundImage = 'url("' + SOULS_ICON_IMAGE + '")';
+				soulsIcon.style.backgroundSize = 'contain';
+				soulsIcon.style.backgroundRepeat = 'no-repeat';
+			}
 
-			winRateLabel.style.color =
-				this._getWinRateColor(
-					option
-				);
+			var matchesLabel = overlay.FindChild(MATCHES_LABEL_ID);
+			if (!isValidPanel(matchesLabel)) {
+				matchesLabel = $.CreatePanel('Label', overlay, MATCHES_LABEL_ID);
+				if (!isValidPanel(matchesLabel)) { return false; }
+				this._configureLabel(matchesLabel, 21);
+				matchesLabel.style.height = '13px';
+				matchesLabel.style.color = '#FFFFFF';
+				matchesLabel.style.zIndex = '1';
+			}
 
-			soulsLabel.text =
-				this._formatSouls15(
-					option
-				);
-
-			soulsLabel.style.color =
-				this._getSouls15Color(
-					option
-				);
+			var soulsColor = this._getSouls15Color(option);
+			soulsLabel.text = this._formatSouls15(option);
+			soulsLabel.style.color = soulsColor;
+			soulsIcon.style.washColor = soulsColor;
+			matchesLabel.text = String(option && option.hasNetWorthData ?
+				option.netWorthMatches : 0) + ' M';
 
 			/*
 			 * BEST applies to the entire
@@ -707,17 +718,13 @@ var ThreatHud = ThreatHud || {};
 				option &&
 				option.isBest
 			) {
-				overlay.style.backgroundColor =
-					BEST_BACKGROUND;
+				backdrop.style.washColor = BEST_BACKGROUND;
+				backdrop.style.opacity = FLAME_OPACITY;
 
-				overlay.style.border =
-					BEST_BORDER;
+				this._prepareFlame(playerPanel, overlay);
 			} else {
-				overlay.style.backgroundColor =
-					OVERLAY_BACKGROUND;
-
-				overlay.style.border =
-					OVERLAY_BORDER;
+				backdrop.style.washColor = OVERLAY_BACKGROUND;
+				backdrop.style.opacity = '1';
 			}
 
 			overlay.visible =
@@ -729,6 +736,161 @@ var ThreatHud = ThreatHud || {};
 
 			return true;
 		};
+
+	CurrentMatchLaneAdvisorOverlay.prototype._prepareBackdrop = function (overlay) {
+		var viewport = overlay.FindChild(BACKDROP_ID);
+		if (!isValidPanel(viewport)) {
+			viewport = $.CreatePanel('Panel', overlay, BACKDROP_ID);
+			if (!isValidPanel(viewport)) { return null; }
+			viewport.hittest = false;
+			viewport.hittestchildren = false;
+			viewport.style.width = OVERLAY_WIDTH + 'px';
+			viewport.style.height = OVERLAY_HEIGHT + 'px';
+			viewport.style.position = '0px 0px 0px';
+			viewport.style.overflow = 'clip clip';
+			viewport.style.flowChildren = 'none';
+			viewport.style.zIndex = '0';
+			// Pick once per block; repeated results keep the same shape.
+			viewport.SetAttributeInt('threathud_lane_block_variant',
+				Math.floor(Math.random() * BACKDROP_VARIANTS));
+		}
+		var image = viewport.FindChild(BACKDROP_IMAGE_ID);
+		if (!isValidPanel(image)) {
+			image = $.CreatePanel('Image', viewport, BACKDROP_IMAGE_ID);
+			if (!isValidPanel(image)) { return null; }
+			image.hittest = false;
+			image.style.width = (OVERLAY_WIDTH * BACKDROP_COLUMNS) + 'px';
+			image.style.height = (OVERLAY_HEIGHT * BACKDROP_ROWS) + 'px';
+			image.style.horizontalAlign = 'left';
+			image.style.verticalAlign = 'top';
+			var variant = viewport.GetAttributeInt('threathud_lane_block_variant', 0);
+			image.style.position = (-(variant % BACKDROP_COLUMNS) * OVERLAY_WIDTH) +
+				'px ' + (-Math.floor(variant / BACKDROP_COLUMNS) * OVERLAY_HEIGHT) + 'px 0px';
+			image.SetImage(BACKDROP_IMAGE);
+		}
+		return image;
+	};
+
+	CurrentMatchLaneAdvisorOverlay.prototype._prepareFlame = function (playerPanel, overlay) {
+		try {
+			var image = playerPanel.FindChild(FLAME_ID);
+			if (!isValidPanel(image)) {
+				image = $.CreatePanel('Panel', playerPanel, FLAME_ID);
+			}
+			if (!isValidPanel(image)) { return; }
+			image.visible = false;
+			image.hittest = false;
+			image.hittestchildren = false;
+			image.style.width = FLAME_SIZE + 'px';
+			image.style.height = FLAME_SIZE + 'px';
+			image.style.horizontalAlign = 'center';
+			image.style.verticalAlign = 'top';
+			// The prepared 400x400 canvas places the card anchor at (124,366).
+			// Align that point with the centre/top of this existing 84px block.
+			image.style.position = (FLAME_SIZE * (0.5 - 124 / 400)).toFixed(2) +
+				'px ' + (OVERLAY_TOP + 5 - FLAME_SIZE * 366 / 400).toFixed(2) + 'px 0px';
+			image.style.zIndex = '29';
+			image.style.opacity = FLAME_OPACITY;
+			image.style.overflow = 'clip clip';
+			image.style.flowChildren = 'none';
+			var atlasImage = image.FindChild(FLAME_ATLAS_ID);
+			if (!isValidPanel(atlasImage)) {
+				atlasImage = $.CreatePanel('Image', image, FLAME_ATLAS_ID);
+			}
+			if (!isValidPanel(atlasImage)) { return; }
+			atlasImage.hittest = false;
+			atlasImage.hittestchildren = false;
+			atlasImage.style.width = (FLAME_SIZE * FLAME_ATLAS_COLUMNS) + 'px';
+			atlasImage.style.height = (FLAME_SIZE * FLAME_ATLAS_ROWS) + 'px';
+			atlasImage.style.horizontalAlign = 'left';
+			atlasImage.style.verticalAlign = 'top';
+			atlasImage.style.position = '0px 0px 0px';
+			// Keep the same resource attached across frames and recommendation renders.
+			if (atlasImage.GetAttributeString('threathud_flame_atlas', '') !== FLAME_ATLAS_IMAGE) {
+				atlasImage.SetImage(FLAME_ATLAS_IMAGE);
+				atlasImage.SetAttributeString('threathud_flame_atlas', FLAME_ATLAS_IMAGE);
+			}
+			this._flameEntries.push({ playerPanel: playerPanel, overlay: overlay,
+				image: image, atlasImage: atlasImage, frame: -1, failed: false });
+		} catch (error) {
+			this._log('Lane Advisor flame: prepare failed | error=' + String(error));
+		}
+	};
+
+	CurrentMatchLaneAdvisorOverlay.prototype._isFlameVisible = function (entry) {
+		if (entry.failed || !isValidPanel(entry.image) || !isValidPanel(entry.atlasImage) ||
+			!isValidPanel(entry.overlay) ||
+			!isValidPanel(entry.playerPanel) || !entry.overlay.visible ||
+			!this._isLaneSwapAvailable(entry.playerPanel)) {
+			return false;
+		}
+		// Also honour a hidden scoreboard/HUD ancestor without another poller.
+		var panel = entry.playerPanel;
+		for (var depth = 0; depth < 32 && isValidPanel(panel); depth++) {
+			if (panel.visible === false) { return false; }
+			if (typeof panel.GetParent !== 'function') { break; }
+			panel = panel.GetParent();
+		}
+		return true;
+	};
+
+	CurrentMatchLaneAdvisorOverlay.prototype._startFlameAnimation = function () {
+		if (this._flameRunning || this._flameEntries.length === 0) { return; }
+		var hasVisible = false;
+		for (var i = 0; i < this._flameEntries.length; i++) {
+			if (this._isFlameVisible(this._flameEntries[i])) { hasVisible = true; break; }
+		}
+		if (!hasVisible) { return; }
+		var self = this;
+		var generation = ++this._flameGeneration;
+		var frame = 0;
+		this._flameRunning = true;
+		this._log('Lane Advisor flame: START | panels=' + this._flameEntries.length +
+			' | frames=' + FLAME_FRAME_COUNT + ' | fps=10 | mode=atlas');
+
+		function tick() {
+			if (!self._flameRunning || generation !== self._flameGeneration) { return; }
+			self._flameSchedule = null;
+			var visibleCount = 0;
+			for (var index = 0; index < self._flameEntries.length; index++) {
+				var entry = self._flameEntries[index];
+				if (!isValidPanel(entry.image)) { continue; }
+				if (!self._isFlameVisible(entry)) { entry.image.visible = false; continue; }
+				try {
+					if (entry.frame !== frame) {
+						var column = frame % FLAME_ATLAS_COLUMNS;
+						var row = Math.floor(frame / FLAME_ATLAS_COLUMNS);
+						entry.atlasImage.style.position = (-column * FLAME_SIZE) + 'px ' +
+							(-row * FLAME_SIZE) + 'px 0px';
+						entry.frame = frame;
+					}
+					entry.image.visible = true;
+					visibleCount++;
+				} catch (error) {
+					entry.failed = true;
+					entry.image.visible = false;
+					self._log('Lane Advisor flame: image failed | error=' + String(error));
+				}
+			}
+			if (visibleCount === 0) { self._stopFlameAnimation(); return; }
+			frame = (frame + 1) % FLAME_FRAME_COUNT;
+			self._flameSchedule = $.Schedule(FLAME_FRAME_INTERVAL, tick);
+		}
+		tick();
+	};
+
+	CurrentMatchLaneAdvisorOverlay.prototype._stopFlameAnimation = function () {
+		this._flameRunning = false;
+		this._flameGeneration++;
+		if (this._flameSchedule !== null && typeof $.CancelScheduled === 'function') {
+			try { $.CancelScheduled(this._flameSchedule); } catch (error) {}
+		}
+		this._flameSchedule = null;
+		for (var index = 0; index < this._flameEntries.length; index++) {
+			var image = this._flameEntries[index].image;
+			if (isValidPanel(image)) { image.visible = false; }
+		}
+	};
 
 	CurrentMatchLaneAdvisorOverlay.prototype._configureOverlay =
 		function (overlay) {
@@ -757,11 +919,8 @@ var ThreatHud = ThreatHud || {};
 				) +
 				'px 0px';
 
-			overlay.style.backgroundColor =
-				OVERLAY_BACKGROUND;
-
-			overlay.style.border =
-				OVERLAY_BORDER;
+			overlay.style.backgroundColor = '#00000000';
+			overlay.style.border = '0px solid #00000000';
 
 			overlay.style.zIndex =
 				'30';
@@ -809,7 +968,7 @@ var ThreatHud = ThreatHud || {};
 				'bold';
 
 			label.style.fontFamily =
-				'block';
+				'VALVEOracle';
 
 			label.style.textOverflow =
 				'shrink';
@@ -844,35 +1003,13 @@ var ThreatHud = ThreatHud || {};
 			return null;
 		};
 
-	CurrentMatchLaneAdvisorOverlay.prototype._formatWinRate =
-		function (option) {
-			if (
-				!option ||
-				!option.hasMatchData
-			) {
-				return '— WR n=0';
-			}
-
-			return (
-				option
-					.winRatePercent
-					.toFixed(
-						1
-					) +
-				'% WR n=' +
-				String(
-					option.matches
-				)
-			);
-		};
-
 	CurrentMatchLaneAdvisorOverlay.prototype._formatSouls15 =
 		function (option) {
 			if (
 				!option ||
 				!option.hasNetWorthData
 			) {
-				return '— S15 n=0';
+				return '—';
 			}
 
 			var rounded =
@@ -890,38 +1027,8 @@ var ThreatHud = ThreatHud || {};
 				) +
 				String(
 					rounded
-				) +
-				' S15 n=' +
-				String(
-					option.netWorthMatches
 				)
 			);
-		};
-
-	CurrentMatchLaneAdvisorOverlay.prototype._getWinRateColor =
-		function (option) {
-			if (
-				!option ||
-				!option.hasMatchData
-			) {
-				return '#D6C06E';
-			}
-
-			if (
-				option.winRatePercent >=
-					55
-			) {
-				return '#8FE88F';
-			}
-
-			if (
-				option.winRatePercent <
-					45
-			) {
-				return '#FF9292';
-			}
-
-			return '#FFFFFF';
 		};
 
 	CurrentMatchLaneAdvisorOverlay.prototype._getSouls15Color =
@@ -944,7 +1051,7 @@ var ThreatHud = ThreatHud || {};
 				option.netWorthDiff15 <
 					0
 			) {
-				return '#FF9292';
+				return '#E86A62';
 			}
 
 			return '#FFFFFF';

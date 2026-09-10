@@ -156,6 +156,72 @@ function Get-CompileKeyForFile($FileInfo) {
     return (Get-FileHash -Path $FileInfo.FullName -Algorithm MD5).Hash
 }
 
+# These UI atlases keep their original PNG payload in a native Source 2 texture.
+# Other images (and explicit .vtex sidecars) still use resourcecompiler.
+function Test-PngVtexAtlas([string]$RelativePath) {
+    $normalized = $RelativePath.Replace('\', '/').ToLowerInvariant()
+    return $normalized -eq 'panorama/images/custom_game/threathud_lane_flame/flame_atlas.png' -or
+           $normalized -eq 'panorama/images/custom_game/threathud_lane_blocks/block_shapes.png'
+}
+
+function Write-PngVtexAtlas([string]$SourcePath, [string]$OutputPath) {
+    $png = [System.IO.File]::ReadAllBytes($SourcePath)
+    $signature = [byte[]](137, 80, 78, 71, 13, 10, 26, 10)
+    if ($png.Length -lt 33) { throw "PNG is truncated: $SourcePath" }
+    for ($i = 0; $i -lt $signature.Length; $i++) {
+        if ($png[$i] -ne $signature[$i]) { throw "Invalid PNG signature: $SourcePath" }
+    }
+    if ([System.Text.Encoding]::ASCII.GetString($png, 12, 4) -ne 'IHDR' -or
+        $png[8] -ne 0 -or $png[9] -ne 0 -or $png[10] -ne 0 -or $png[11] -ne 13 -or
+        $png[24] -ne 8 -or $png[25] -ne 6) {
+        throw "Expected an 8-bit RGBA PNG atlas: $SourcePath"
+    }
+    $width = [long]$png[16] * 16777216 + [long]$png[17] * 65536 + [long]$png[18] * 256 + $png[19]
+    $height = [long]$png[20] * 16777216 + [long]$png[21] * 65536 + [long]$png[22] * 256 + $png[23]
+    if ($width -lt 1 -or $height -lt 1 -or $width -gt 65535 -or $height -gt 65535) {
+        throw "PNG dimensions exceed the VTEX limits: $SourcePath"
+    }
+
+    # Resource header + one DATA block. FileSize excludes the trailing PNG.
+    # PNG_RGBA8888 (16) preserves exact RGBA pixels; no mipmaps or color processing.
+    $header = New-Object byte[] 80
+    [System.BitConverter]::GetBytes([uint32]80).CopyTo($header, 0)
+    [System.BitConverter]::GetBytes([uint16]12).CopyTo($header, 4)
+    [System.BitConverter]::GetBytes([uint16]1).CopyTo($header, 6)
+    [System.BitConverter]::GetBytes([uint32]8).CopyTo($header, 8)
+    [System.BitConverter]::GetBytes([uint32]1).CopyTo($header, 12)
+    [System.Text.Encoding]::ASCII.GetBytes('DATA').CopyTo($header, 16)
+    [System.BitConverter]::GetBytes([uint32]12).CopyTo($header, 20)
+    [System.BitConverter]::GetBytes([uint32]48).CopyTo($header, 24)
+    [System.BitConverter]::GetBytes([uint16]1).CopyTo($header, 32)
+    [System.BitConverter]::GetBytes([uint16]11).CopyTo($header, 34) # CLAMPS | CLAMPT | NO_LOD
+    [System.BitConverter]::GetBytes([uint16]$width).CopyTo($header, 52)
+    [System.BitConverter]::GetBytes([uint16]$height).CopyTo($header, 54)
+    [System.BitConverter]::GetBytes([uint16]1).CopyTo($header, 56) # depth
+    $header[58] = 16
+    $header[59] = 1 # one mip level
+
+    $directory = [System.IO.Path]::GetDirectoryName($OutputPath)
+    [System.IO.Directory]::CreateDirectory($directory) | Out-Null
+    $tempPath = $OutputPath + '.' + [System.Guid]::NewGuid().ToString('N') + '.tmp'
+    try {
+        $stream = [System.IO.File]::Open($tempPath, [System.IO.FileMode]::CreateNew)
+        try {
+            $stream.Write($header, 0, $header.Length)
+            $stream.Write($png, 0, $png.Length)
+        } finally {
+            $stream.Dispose()
+        }
+        if ([System.IO.File]::Exists($OutputPath)) {
+            [System.IO.File]::Replace($tempPath, $OutputPath, [System.Management.Automation.Language.NullString]::Value)
+        } else {
+            [System.IO.File]::Move($tempPath, $OutputPath)
+        }
+    } finally {
+        if ([System.IO.File]::Exists($tempPath)) { [System.IO.File]::Delete($tempPath) }
+    }
+}
+
 function Get-CompiledOutputPath($BaseDir, $RelativePath, $CompiledExtension) {
     $compiledPath = [System.IO.Path]::ChangeExtension($RelativePath, $CompiledExtension.TrimStart('.'))
     return Join-Path $BaseDir $compiledPath
@@ -525,6 +591,7 @@ while ($true) {
         }
         $CurrentFiles = @{}
         $FilesToCompile = New-Object System.Collections.Generic.List[string]
+        $PngTextures = New-Object System.Collections.Generic.List[object]
         
         $Utf8NoBom = New-Object System.Text.UTF8Encoding $false
         $AllowedExts = @('.xml', '.css', '.js', '.vsndevts', '.wav', '.vtex', '.vsvg', '.vpcf', '.vmdl', '.vmat')
@@ -553,7 +620,10 @@ while ($true) {
             $cacheKey = "${SelectedMod}|${relPath}".ToLower()
             $CurrentFiles[$cacheKey] = $true
 
+            $usePngVtex = (Test-PngVtexAtlas -RelativePath $relPath) -and
+                -not (Test-Path ([System.IO.Path]::ChangeExtension($file.FullName, '.vtex')))
             $compileKey = Get-CompileKeyForFile -FileInfo $file
+            if ($usePngVtex) { $compileKey += '|png-vtex-v1' }
             $contentDest = Join-Path $TempContent $relPath
             $compiledDest = $null
             if ($CompileOutputs.ContainsKey($file.Extension)) {
@@ -575,6 +645,16 @@ while ($true) {
                 $relBase = [System.IO.Path]::GetFileNameWithoutExtension($relPath)
                 $bareCompiled = Join-Path $TempGame (Join-Path $relDir "$relBase.vtex_c")
                 $compiledMissing = (-not (Test-Path $bareCompiled))
+
+                # Keep generated descriptors alive on unchanged incremental builds.
+                # Cleanup also removes their compiled texture, so these must be
+                # tracked even when the PNG does not need compilation this run.
+                $bareVtexSourcePath = [System.IO.Path]::ChangeExtension($file.FullName, '.vtex')
+                $genBareVtexPath = [System.IO.Path]::ChangeExtension($contentDest, '.vtex')
+                if (-not $usePngVtex -and -not (Test-Path $bareVtexSourcePath)) {
+                    $genBareRelPath = $genBareVtexPath.Substring($TempContent.Length + 1)
+                    $CurrentFiles["${SelectedMod}|${genBareRelPath}".ToLower()] = $true
+                }
             }
 
             $needsCopy = $hashChanged -or $contentMissing
@@ -599,23 +679,27 @@ while ($true) {
                 $FilesToCompile.Add($contentDest)
             }
 
-            if ($AutoVtexSourceExts -contains $file.Extension -and ($needsCopy -or $needsCompile)) {
+            if ($usePngVtex) {
+                # Queue all selected atlases: cleanup below can remove an output
+                # alongside an obsolete generated descriptor, even on a cache hit.
+                $PngTextures.Add([pscustomobject]@{
+                    SourcePath = $file.FullName
+                    OutputPath = $compiledDest
+                    RelativePath = $relPath
+                    NeedsWrite = ($needsCopy -or $needsCompile)
+                })
+            } elseif ($AutoVtexSourceExts -contains $file.Extension -and ($needsCopy -or $needsCompile)) {
                 $relFileName = $relPath -replace '\\', '/'
                 $vtexBody = Get-AutoVtexBody -RelFileName $relFileName
                 $contentDir = Split-Path $contentDest
                 $contentBase = [System.IO.Path]::GetFileNameWithoutExtension($contentDest)
                 $extNoDot = $file.Extension.TrimStart('.').ToLowerInvariant()
 
-                $bareVtexSourcePath = [System.IO.Path]::ChangeExtension($file.FullName, '.vtex')
                 if (Test-Path $bareVtexSourcePath) {
                     Write-Host "  Skipping bare auto-vtex for $relPath (custom .vtex present)" -ForegroundColor DarkGray
                 } else {
-                    $genBareVtexPath = [System.IO.Path]::ChangeExtension($contentDest, '.vtex')
                     [System.IO.File]::WriteAllText($genBareVtexPath, $vtexBody, $Utf8NoBom)
                     $FilesToCompile.Add($genBareVtexPath)
-
-                    $genBareRelPath = $genBareVtexPath.Substring($TempContent.Length + 1)
-                    $CurrentFiles["${SelectedMod}|${genBareRelPath}".ToLower()] = $true
                 }
             }
 
@@ -698,6 +782,15 @@ while ($true) {
             Write-Host "  Changed files:" -ForegroundColor DarkGray
             foreach ($changedFile in $changedFiles) {
                 Write-Host "    - $changedFile" -ForegroundColor DarkGray
+            }
+        }
+
+        # Write after stale-file cleanup and before committing the build cache.
+        foreach ($texture in $PngTextures) {
+            if ($texture.NeedsWrite -or -not (Test-Path $texture.OutputPath)) {
+                Write-PngVtexAtlas -SourcePath $texture.SourcePath -OutputPath $texture.OutputPath
+                $textureBytes = (Get-Item $texture.OutputPath).Length
+                Write-Host "  PNG VTEX: $($texture.RelativePath) ($textureBytes bytes)" -ForegroundColor DarkGray
             }
         }
 
